@@ -27,7 +27,7 @@ interface ClaudeConfig {
 	baseUrl: string;
 	apiKey: string;
 	authKind: AuthKind;
-	model: string;
+	models: string[];
 }
 
 interface CodexConfig {
@@ -54,6 +54,15 @@ type StreamBlock =
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const TEXT_INPUT = ["text"] as ("text" | "image")[];
 const TEXT_IMAGE_INPUT = ["text", "image"] as ("text" | "image")[];
+const DEFAULT_CLAUDE_MODELS = [
+	"claude-opus-4-7",
+	"claude-opus-4-6",
+	"claude-sonnet-4-6",
+	"claude-opus-4-5",
+	"claude-sonnet-4-5",
+	"claude-sonnet-4",
+	"claude-opus-4",
+];
 
 function readJsonObject(filePath: string): Record<string, unknown> | undefined {
 	if (!existsSync(filePath)) return undefined;
@@ -73,6 +82,18 @@ function stringContent(value: unknown): string | undefined {
 	return typeof value === "string" ? value : undefined;
 }
 
+function splitModelList(value: unknown): string[] {
+	if (typeof value !== "string") return [];
+	return value
+		.split(/[,\s]+/)
+		.map((model) => model.trim())
+		.filter((model) => model.length > 0);
+}
+
+function uniqueStrings(values: string[]): string[] {
+	return Array.from(new Set(values));
+}
+
 function loadClaudeConfig(): ClaudeConfig | undefined {
 	const settings = readJsonObject(join(homedir(), ".claude", "settings.json"));
 	const env = isRecord(settings?.env) ? settings.env : undefined;
@@ -87,11 +108,14 @@ function loadClaudeConfig(): ClaudeConfig | undefined {
 		baseUrl,
 		apiKey: authToken ?? apiKey ?? "",
 		authKind: authToken ? "bearer" : "api-key",
-		model:
+		models: uniqueStrings([
+			...splitModelList(env.PI_CC_SWITCH_CLAUDE_MODELS),
 			stringValue(env.ANTHROPIC_MODEL) ??
-			stringValue(env.ANTHROPIC_DEFAULT_SONNET_MODEL) ??
-			stringValue(env.ANTHROPIC_DEFAULT_OPUS_MODEL) ??
-			"claude-sonnet-4-5",
+				stringValue(env.ANTHROPIC_DEFAULT_SONNET_MODEL) ??
+				stringValue(env.ANTHROPIC_DEFAULT_OPUS_MODEL) ??
+				"claude-sonnet-4-5",
+			...DEFAULT_CLAUDE_MODELS,
+		]),
 	};
 }
 
@@ -539,17 +563,15 @@ export default function (pi: ExtensionAPI) {
 			baseUrl: claude.baseUrl,
 			apiKey: claude.apiKey,
 			api: "cc-switch-anthropic" as Api,
-			models: [
-				{
-					id: claude.model,
-					name: `cc-switch Claude (${claude.model})`,
-					reasoning: true,
-					input: TEXT_IMAGE_INPUT,
-					cost: ZERO_COST,
-					contextWindow: 200000,
-					maxTokens: 64000,
-				},
-			],
+			models: claude.models.map((model) => ({
+				id: model,
+				name: `cc-switch Claude (${model})`,
+				reasoning: true,
+				input: TEXT_IMAGE_INPUT,
+				cost: ZERO_COST,
+				contextWindow: 200000,
+				maxTokens: 64000,
+			})),
 			streamSimple: (model, context, options) => streamCcSwitchAnthropic(claude.authKind, model, context, options),
 		});
 	}
@@ -581,7 +603,7 @@ export default function (pi: ExtensionAPI) {
 		handler: (_args, ctx) => {
 			const lines = [
 				claude
-					? `Claude: cc-switch-claude/${claude.model} -> ${claude.baseUrl}`
+					? `Claude: ${claude.models.map((model) => `cc-switch-claude/${model}`).join(", ")} -> ${claude.baseUrl}`
 					: "Claude: no ~/.claude/settings.json provider found",
 				codex
 					? `Codex: cc-switch-codex/${codex.model} -> ${codex.baseUrl}`
