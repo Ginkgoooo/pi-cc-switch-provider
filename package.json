@@ -1,0 +1,23 @@
+﻿{
+  "name": "pi-cc-switch-provider",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi provider extension that imports active Codex and Claude settings from cc-switch.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "cc-switch",
+    "codex",
+    "claude"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/cc-switch-provider.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
