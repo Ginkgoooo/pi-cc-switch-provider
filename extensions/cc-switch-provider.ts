@@ -1,4 +1,5 @@
-import { existsSync, readFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -63,8 +64,13 @@ const DEFAULT_CLAUDE_MODELS = [
 	"claude-sonnet-4",
 	"claude-opus-4",
 ];
-const ANTHROPIC_BETAS = ["fine-grained-tool-streaming-2025-05-14", "interleaved-thinking-2025-05-14"];
 const CONTEXT_1M_BETA = "context-1m-2025-08-07";
+const CLAUDE_CODE_BETAS = [
+	"claude-code-20250219",
+	CONTEXT_1M_BETA,
+	"interleaved-thinking-2025-05-14",
+	"effort-2025-11-24",
+];
 
 function readJsonObject(filePath: string): Record<string, unknown> | undefined {
 	if (!existsSync(filePath)) return undefined;
@@ -148,22 +154,28 @@ function loadCodexConfig(): CodexConfig | undefined {
 
 function endpointForAnthropicMessages(baseUrl: string): string {
 	const trimmed = baseUrl.replace(/\/+$/, "");
-	if (/\/v\d+\/messages$/.test(trimmed)) return trimmed;
-	if (/\/v\d+$/.test(trimmed)) return `${trimmed}/messages`;
-	return `${trimmed}/v1/messages`;
+	const endpoint = (() => {
+		if (/\/v\d+\/messages$/.test(trimmed)) return trimmed;
+		if (/\/v\d+$/.test(trimmed)) return `${trimmed}/messages`;
+		return `${trimmed}/v1/messages`;
+	})();
+	return `${endpoint}?beta=true`;
 }
 
 function supportsOneMillionContext(modelId: string): boolean {
 	return /^claude-(opus|sonnet)-4(?:-\d+)?(?:-\d+)?$/.test(modelId);
 }
 
-function anthropicBetaHeader(modelId: string): string {
-	const betas = supportsOneMillionContext(modelId) ? [...ANTHROPIC_BETAS, CONTEXT_1M_BETA] : ANTHROPIC_BETAS;
-	return betas.join(",");
+function anthropicBetaHeader(modelId: string): string | undefined {
+	return supportsOneMillionContext(modelId) ? CLAUDE_CODE_BETAS.join(",") : undefined;
 }
 
 function claudeContextWindow(modelId: string): number {
 	return supportsOneMillionContext(modelId) ? 1000000 : 200000;
+}
+
+function resolveClaudeRequestModel(modelId: string): string {
+	return modelId;
 }
 
 function sanitizeText(text: string): string {
@@ -190,14 +202,34 @@ function convertContentBlocks(content: (TextContent | ImageContent)[]): string |
 	});
 }
 
+function convertUserTextContent(text: string): Record<string, unknown>[] {
+	return [{ type: "text", text: sanitizeText(text) }];
+}
+
+function convertUserContent(content: string | (TextContent | ImageContent)[]): Record<string, unknown>[] {
+	if (typeof content === "string") return convertUserTextContent(content);
+	return content.map((block) => {
+		if (block.type === "text") {
+			return { type: "text", text: sanitizeText(block.text) };
+		}
+		return {
+			type: "image",
+			source: {
+				type: "base64",
+				media_type: block.mimeType,
+				data: block.data,
+			},
+		};
+	});
+}
+
 function convertMessages(messages: Message[]): Record<string, unknown>[] {
 	const converted: Record<string, unknown>[] = [];
 
 	for (let index = 0; index < messages.length; index += 1) {
 		const message = messages[index];
 		if (message.role === "user") {
-			const content =
-				typeof message.content === "string" ? sanitizeText(message.content) : convertContentBlocks(message.content);
+			const content = convertUserContent(message.content);
 			if (typeof content !== "string" || content.trim().length > 0) {
 				converted.push({ role: "user", content });
 			}
@@ -288,17 +320,33 @@ function thinkingBudget(reasoning: SimpleStreamOptions["reasoning"], options?: S
 function buildAnthropicPayload(
 	model: Model<Api>,
 	context: Context,
+	sessionId: string,
 	options?: SimpleStreamOptions,
 ): Record<string, unknown> {
 	const payload: Record<string, unknown> = {
-		model: model.id,
+		model: resolveClaudeRequestModel(model.id),
 		messages: convertMessages(context.messages),
 		max_tokens: options?.maxTokens ?? Math.floor(model.maxTokens / 3),
 		stream: true,
 	};
 
+	const systemBlocks: Record<string, unknown>[] = [];
+	if (supportsOneMillionContext(model.id)) {
+		systemBlocks.push({
+			type: "text",
+			text: "You are Claude Code, Anthropic's official CLI for Claude.",
+			cache_control: { type: "ephemeral" },
+		});
+	}
 	if (context.systemPrompt) {
-		payload.system = sanitizeText(context.systemPrompt);
+		systemBlocks.push({
+			type: "text",
+			text: sanitizeText(context.systemPrompt),
+			cache_control: { type: "ephemeral" },
+		});
+	}
+	if (systemBlocks.length > 0) {
+		payload.system = systemBlocks;
 	}
 
 	const tools = convertTools(context.tools);
@@ -306,12 +354,53 @@ function buildAnthropicPayload(
 		payload.tools = tools;
 	}
 
-	const budget = thinkingBudget(options?.reasoning, options);
-	if (model.reasoning && budget) {
-		payload.thinking = { type: "enabled", budget_tokens: budget };
+	if (supportsOneMillionContext(model.id)) {
+		payload.thinking = { type: "adaptive" };
+	} else {
+		const budget = thinkingBudget(options?.reasoning, options);
+		if (model.reasoning && budget) {
+			payload.thinking = { type: "enabled", budget_tokens: budget };
+		}
+	}
+	if (supportsOneMillionContext(model.id)) {
+		payload.output_config = { effort: "xhigh" };
+		payload.metadata = {
+			user_id: JSON.stringify({
+				device_id: createHash("sha256").update(`${homedir()}:pi-cc-switch-provider`).digest("hex"),
+				account_uuid: "",
+				session_id: sessionId,
+			}),
+		};
 	}
 
 	return payload;
+}
+
+function shapeForDebug(value: unknown, depth = 0): unknown {
+	if (depth > 4) return Array.isArray(value) ? `[array:${value.length}]` : typeof value;
+	if (value === null || typeof value === "number" || typeof value === "boolean") return value;
+	if (typeof value === "string") return value.length <= 200 ? value : `<string:${value.length}>`;
+	if (Array.isArray(value)) return { __arrayLength: value.length, items: value.slice(0, 3).map((item) => shapeForDebug(item, depth + 1)) };
+	if (isRecord(value)) {
+		const output: Record<string, unknown> = {};
+		for (const [key, item] of Object.entries(value)) {
+			output[key] = key.toLowerCase().includes("token") || key.toLowerCase().includes("key") ? "<redacted>" : shapeForDebug(item, depth + 1);
+		}
+		return output;
+	}
+	return typeof value;
+}
+
+function writeDebugRequest(headers: Record<string, string>, payload: Record<string, unknown>): void {
+	if (process.env.PI_CC_SWITCH_DEBUG !== "1") return;
+	const redactedHeaders: Record<string, string> = {};
+	for (const [key, value] of Object.entries(headers)) {
+		redactedHeaders[key] = key.toLowerCase().includes("authorization") || key.toLowerCase().includes("key") ? "<redacted>" : value;
+	}
+	writeFileSync(
+		join(process.cwd(), "pi-cc-switch-debug-request.json"),
+		JSON.stringify({ headers: redactedHeaders, payload: shapeForDebug(payload) }, null, 2),
+	);
 }
 
 function parseSseChunk(buffer: string): { events: SseEvent[]; rest: string } {
@@ -502,22 +591,41 @@ function streamCcSwitchAnthropic(
 			const apiKey = options?.apiKey;
 			if (!apiKey) throw new Error("Missing cc-switch Claude credential");
 
+			const sessionId = randomUUID();
 			const headers: Record<string, string> = {
-				accept: "text/event-stream",
+				accept: "application/json",
 				"content-type": "application/json",
 				"anthropic-version": "2023-06-01",
-				"anthropic-beta": anthropicBetaHeader(model.id),
+				"anthropic-dangerous-direct-browser-access": "true",
+				"user-agent": "claude-cli/2.1.123 (external, cli)",
+				"x-app": "cli",
+				"x-claude-code-session-id": sessionId,
+				"x-stainless-arch": "x64",
+				"x-stainless-lang": "js",
+				"x-stainless-os": "Windows",
+				"x-stainless-package-version": "0.81.0",
+				"x-stainless-retry-count": "0",
+				"x-stainless-runtime": "node",
+				"x-stainless-runtime-version": "v24.3.0",
+				"x-stainless-timeout": "600",
 			};
+			const requestModel = resolveClaudeRequestModel(model.id);
+			const betaHeader = anthropicBetaHeader(requestModel);
+			if (betaHeader) {
+				headers["anthropic-beta"] = betaHeader;
+			}
 			if (authKind === "bearer") {
 				headers.Authorization = `Bearer ${apiKey}`;
 			} else {
 				headers["x-api-key"] = apiKey;
 			}
 
+			const payload = buildAnthropicPayload(model, context, sessionId, options);
+			writeDebugRequest(headers, payload);
 			const response = await fetch(endpointForAnthropicMessages(model.baseUrl), {
 				method: "POST",
 				headers,
-				body: JSON.stringify(buildAnthropicPayload(model, context, options)),
+				body: JSON.stringify(payload),
 				signal: options?.signal,
 			});
 
