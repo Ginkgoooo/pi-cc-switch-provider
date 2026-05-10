@@ -63,6 +63,8 @@ const DEFAULT_CLAUDE_MODELS = [
 	"claude-sonnet-4",
 	"claude-opus-4",
 ];
+const ANTHROPIC_BETAS = ["fine-grained-tool-streaming-2025-05-14", "interleaved-thinking-2025-05-14"];
+const CONTEXT_1M_BETA = "context-1m-2025-08-07";
 
 function readJsonObject(filePath: string): Record<string, unknown> | undefined {
 	if (!existsSync(filePath)) return undefined;
@@ -149,6 +151,19 @@ function endpointForAnthropicMessages(baseUrl: string): string {
 	if (/\/v\d+\/messages$/.test(trimmed)) return trimmed;
 	if (/\/v\d+$/.test(trimmed)) return `${trimmed}/messages`;
 	return `${trimmed}/v1/messages`;
+}
+
+function supportsOneMillionContext(modelId: string): boolean {
+	return /^claude-(opus|sonnet)-4(?:-\d+)?(?:-\d+)?$/.test(modelId);
+}
+
+function anthropicBetaHeader(modelId: string): string {
+	const betas = supportsOneMillionContext(modelId) ? [...ANTHROPIC_BETAS, CONTEXT_1M_BETA] : ANTHROPIC_BETAS;
+	return betas.join(",");
+}
+
+function claudeContextWindow(modelId: string): number {
+	return supportsOneMillionContext(modelId) ? 1000000 : 200000;
 }
 
 function sanitizeText(text: string): string {
@@ -491,7 +506,7 @@ function streamCcSwitchAnthropic(
 				accept: "text/event-stream",
 				"content-type": "application/json",
 				"anthropic-version": "2023-06-01",
-				"anthropic-beta": "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
+				"anthropic-beta": anthropicBetaHeader(model.id),
 			};
 			if (authKind === "bearer") {
 				headers.Authorization = `Bearer ${apiKey}`;
@@ -569,7 +584,7 @@ export default function (pi: ExtensionAPI) {
 				reasoning: true,
 				input: TEXT_IMAGE_INPUT,
 				cost: ZERO_COST,
-				contextWindow: 200000,
+				contextWindow: claudeContextWindow(model),
 				maxTokens: 64000,
 			})),
 			streamSimple: (model, context, options) => streamCcSwitchAnthropic(claude.authKind, model, context, options),
