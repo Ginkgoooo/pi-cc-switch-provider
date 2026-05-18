@@ -317,6 +317,20 @@ function thinkingBudget(reasoning: SimpleStreamOptions["reasoning"], options?: S
 	return 20480;
 }
 
+/**
+ * 把 pi 的 ThinkingLevel 映射到 Claude 1M 模型的 output_config.effort 值。
+ * Claude effort 枚举：low | medium | high | xhigh（无 minimal）。
+ * minimal/low 都映到 low，让用户感受到推理强度从弱到强的连续梯度。
+ */
+function effortForReasoning(reasoning: SimpleStreamOptions["reasoning"]): string | undefined {
+	if (!reasoning || reasoning === "off") return undefined;
+	if (reasoning === "minimal" || reasoning === "low") return "low";
+	if (reasoning === "medium") return "medium";
+	if (reasoning === "high") return "high";
+	if (reasoning === "xhigh") return "xhigh";
+	return undefined;
+}
+
 function buildAnthropicPayload(
 	model: Model<Api>,
 	context: Context,
@@ -354,16 +368,16 @@ function buildAnthropicPayload(
 		payload.tools = tools;
 	}
 
+	const reasoning = options?.reasoning;
+	const reasoningOn = reasoning && reasoning !== "off";
 	if (supportsOneMillionContext(model.id)) {
-		payload.thinking = { type: "adaptive" };
-	} else {
-		const budget = thinkingBudget(options?.reasoning, options);
-		if (model.reasoning && budget) {
-			payload.thinking = { type: "enabled", budget_tokens: budget };
+		// 1M 上下文走 adaptive thinking + output_config.effort；effort 跟随用户选择，
+		// reasoning 关闭时既不设 thinking 也不设 output_config，让模型按默认行为出回复。
+		if (reasoningOn) {
+			payload.thinking = { type: "adaptive" };
+			const effort = effortForReasoning(reasoning);
+			if (effort) payload.output_config = { effort };
 		}
-	}
-	if (supportsOneMillionContext(model.id)) {
-		payload.output_config = { effort: "xhigh" };
 		payload.metadata = {
 			user_id: JSON.stringify({
 				device_id: createHash("sha256").update(`${homedir()}:pi-cc-switch-provider`).digest("hex"),
@@ -371,6 +385,11 @@ function buildAnthropicPayload(
 				session_id: sessionId,
 			}),
 		};
+	} else {
+		const budget = thinkingBudget(reasoning, options);
+		if (model.reasoning && budget) {
+			payload.thinking = { type: "enabled", budget_tokens: budget };
+		}
 	}
 
 	return payload;
@@ -690,6 +709,8 @@ export default function (pi: ExtensionAPI) {
 				id: model,
 				name: `cc-switch Claude (${model})`,
 				reasoning: true,
+				// 仅 1M 上下文模型暴露 xhigh 档；其他模型让 pi 的 UI 自动隐藏 xhigh。
+				thinkingLevelMap: supportsOneMillionContext(model) ? { xhigh: "xhigh" } : undefined,
 				input: TEXT_IMAGE_INPUT,
 				cost: ZERO_COST,
 				contextWindow: claudeContextWindow(model),
