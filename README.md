@@ -26,30 +26,46 @@ npm install -g @earendil-works/pi-coding-agent
 pi install git:github.com/Ginkgoooo/pi-cc-switch-provider
 ```
 
-### Verify
+### Commands
+
+List all cc-switch models:
 
 ```powershell
 pi --list-models cc-switch
 ```
 
-### Usage
-
-```powershell
-pi --provider cc-switch-codex --model gpt-5.5
-pi --provider cc-switch-claude --model claude-sonnet-4-5
-pi --provider cc-switch-claude --model claude-opus-4-7
-```
-
-You can also start Pi directly:
+Start Pi directly, then select a model inside Pi:
 
 ```powershell
 pi
 ```
 
-Inside Pi, run:
+```text
+/model
+```
+
+Start Pi with the active Codex model imported from cc-switch:
+
+```powershell
+pi --provider cc-switch-codex --model gpt-5.5
+```
+
+Start Pi with a specific Claude model imported from cc-switch:
+
+```powershell
+pi --provider cc-switch-claude --model claude-sonnet-4-5
+pi --provider cc-switch-claude --model claude-opus-4-7
+```
+
+Show cc-switch provider import status inside Pi:
 
 ```text
 /cc-switch
+```
+
+Select or switch models inside Pi:
+
+```text
 /model
 ```
 
@@ -113,30 +129,46 @@ npm install -g @earendil-works/pi-coding-agent
 pi install git:github.com/Ginkgoooo/pi-cc-switch-provider
 ```
 
-### 验证
+### 命令清单
+
+列出所有 cc-switch 模型：
 
 ```powershell
 pi --list-models cc-switch
 ```
 
-### 使用方式
-
-```powershell
-pi --provider cc-switch-codex --model gpt-5.5
-pi --provider cc-switch-claude --model claude-sonnet-4-5
-pi --provider cc-switch-claude --model claude-opus-4-7
-```
-
-也可以直接启动 Pi：
+直接启动 Pi，然后在 Pi 内选择模型：
 
 ```powershell
 pi
 ```
 
-在 Pi 内部可运行：
+```text
+/model
+```
+
+使用 cc-switch 导入的当前 Codex 模型启动 Pi：
+
+```powershell
+pi --provider cc-switch-codex --model gpt-5.5
+```
+
+使用 cc-switch 导入的指定 Claude 模型启动 Pi：
+
+```powershell
+pi --provider cc-switch-claude --model claude-sonnet-4-5
+pi --provider cc-switch-claude --model claude-opus-4-7
+```
+
+在 Pi 内查看 cc-switch provider 导入状态：
 
 ```text
 /cc-switch
+```
+
+在 Pi 内选择或切换模型：
+
+```text
 /model
 ```
 
