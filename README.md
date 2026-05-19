@@ -449,3 +449,5 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 - `%USERPROFILE%\.claude\settings.json`
 - `%USERPROFILE%\.codex\auth.json`
 - `%USERPROFILE%\.codex\config.toml`
+### 友情链接
+https://linux.do/
