@@ -26,7 +26,7 @@ npm install -g @earendil-works/pi-coding-agent
 pi install git:github.com/Ginkgoooo/pi-cc-switch-provider
 ```
 
-### Commands
+### cc-switch Provider Commands
 
 List all cc-switch models:
 
@@ -63,13 +63,140 @@ Show cc-switch provider import status inside Pi:
 /cc-switch
 ```
 
-Select or switch models inside Pi:
+### Pi Built-in CLI Commands
+
+General syntax:
+
+```bash
+pi [options] [@files...] [messages...]
+```
+
+Package commands:
+
+```bash
+pi install <source> [-l]
+pi remove <source> [-l]
+pi uninstall <source> [-l]
+pi update [source|self|pi]
+pi update --extensions
+pi update --self
+pi update --extension <src>
+pi list
+pi config
+```
+
+Modes:
+
+```bash
+pi
+pi -p "Summarize this codebase"
+pi --print "Summarize this codebase"
+pi --mode json
+pi --mode rpc
+pi --export <in> [out]
+```
+
+Model options:
+
+```bash
+pi --provider <name>
+pi --model <pattern>
+pi --api-key <key>
+pi --thinking <off|minimal|low|medium|high|xhigh>
+pi --models <patterns>
+pi --list-models [search]
+```
+
+Session options:
+
+```bash
+pi -c
+pi --continue
+pi -r
+pi --resume
+pi --session <path|id>
+pi --fork <path|id>
+pi --session-dir <dir>
+pi --no-session
+```
+
+Tool options:
+
+```bash
+pi --tools <list>
+pi -t <list>
+pi --no-builtin-tools
+pi -nbt
+pi --no-tools
+pi -nt
+```
+
+Built-in tools include `read`, `bash`, `edit`, `write`, `grep`, `find`, and `ls`.
+
+Resource options:
+
+```bash
+pi --extension <source>
+pi -e <source>
+pi --no-extensions
+pi --skill <path>
+pi --no-skills
+pi --prompt-template <path>
+pi --no-prompt-templates
+pi --theme <path>
+pi --no-themes
+pi --no-context-files
+pi -nc
+```
+
+Other options:
+
+```bash
+pi --system-prompt <text>
+pi --append-system-prompt <text>
+pi --verbose
+pi --help
+pi -h
+pi --version
+pi -v
+```
+
+File arguments:
+
+```bash
+pi @prompt.md "Answer this"
+pi -p @screenshot.png "What's in this image?"
+pi @code.ts @test.ts "Review these files"
+```
+
+### Pi Built-in Slash Commands
 
 ```text
+/login
+/logout
 /model
+/scoped-models
+/settings
+/resume
+/new
+/name <name>
+/session
+/tree
+/fork
+/clone
+/compact [prompt]
+/copy
+/export [file]
+/share
+/reload
+/hotkeys
+/changelog
+/quit
 ```
 
 ### Optional Shortcuts
+
+Install shortcut commands:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
@@ -81,6 +208,14 @@ Then use:
 pi-models
 pi-codex
 pi-claude
+```
+
+The shortcuts expand to:
+
+```powershell
+pi-models  # pi --list-models cc-switch
+pi-codex   # pi --provider cc-switch-codex --model gpt-5.5
+pi-claude  # pi --provider cc-switch-claude --model claude-sonnet-4-5
 ```
 
 ### Claude Models
@@ -129,7 +264,7 @@ npm install -g @earendil-works/pi-coding-agent
 pi install git:github.com/Ginkgoooo/pi-cc-switch-provider
 ```
 
-### 命令清单
+### cc-switch Provider 命令
 
 列出所有 cc-switch 模型：
 
@@ -166,13 +301,140 @@ pi --provider cc-switch-claude --model claude-opus-4-7
 /cc-switch
 ```
 
-在 Pi 内选择或切换模型：
+### Pi 内置 CLI 命令
+
+通用语法：
+
+```bash
+pi [options] [@files...] [messages...]
+```
+
+包管理命令：
+
+```bash
+pi install <source> [-l]
+pi remove <source> [-l]
+pi uninstall <source> [-l]
+pi update [source|self|pi]
+pi update --extensions
+pi update --self
+pi update --extension <src>
+pi list
+pi config
+```
+
+运行模式：
+
+```bash
+pi
+pi -p "Summarize this codebase"
+pi --print "Summarize this codebase"
+pi --mode json
+pi --mode rpc
+pi --export <in> [out]
+```
+
+模型选项：
+
+```bash
+pi --provider <name>
+pi --model <pattern>
+pi --api-key <key>
+pi --thinking <off|minimal|low|medium|high|xhigh>
+pi --models <patterns>
+pi --list-models [search]
+```
+
+会话选项：
+
+```bash
+pi -c
+pi --continue
+pi -r
+pi --resume
+pi --session <path|id>
+pi --fork <path|id>
+pi --session-dir <dir>
+pi --no-session
+```
+
+工具选项：
+
+```bash
+pi --tools <list>
+pi -t <list>
+pi --no-builtin-tools
+pi -nbt
+pi --no-tools
+pi -nt
+```
+
+内置工具包括 `read`、`bash`、`edit`、`write`、`grep`、`find` 和 `ls`。
+
+资源选项：
+
+```bash
+pi --extension <source>
+pi -e <source>
+pi --no-extensions
+pi --skill <path>
+pi --no-skills
+pi --prompt-template <path>
+pi --no-prompt-templates
+pi --theme <path>
+pi --no-themes
+pi --no-context-files
+pi -nc
+```
+
+其他选项：
+
+```bash
+pi --system-prompt <text>
+pi --append-system-prompt <text>
+pi --verbose
+pi --help
+pi -h
+pi --version
+pi -v
+```
+
+文件参数：
+
+```bash
+pi @prompt.md "Answer this"
+pi -p @screenshot.png "What's in this image?"
+pi @code.ts @test.ts "Review these files"
+```
+
+### Pi 内置 Slash 命令
 
 ```text
+/login
+/logout
 /model
+/scoped-models
+/settings
+/resume
+/new
+/name <name>
+/session
+/tree
+/fork
+/clone
+/compact [prompt]
+/copy
+/export [file]
+/share
+/reload
+/hotkeys
+/changelog
+/quit
 ```
 
 ### 可选快捷命令
+
+安装快捷命令：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
@@ -184,6 +446,14 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 pi-models
 pi-codex
 pi-claude
+```
+
+快捷命令展开后等价于：
+
+```powershell
+pi-models  # pi --list-models cc-switch
+pi-codex   # pi --provider cc-switch-codex --model gpt-5.5
+pi-claude  # pi --provider cc-switch-claude --model claude-sonnet-4-5
 ```
 
 ### Claude 模型
