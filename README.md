@@ -40,10 +40,17 @@ pi --provider cc-switch-claude --model claude-sonnet-4-5
 pi --provider cc-switch-claude --model claude-opus-4-7
 ```
 
+You can also start Pi directly:
+
+```powershell
+pi
+```
+
 Inside Pi, run:
 
 ```text
 /cc-switch
+/model
 ```
 
 ### Optional Shortcuts
@@ -120,10 +127,17 @@ pi --provider cc-switch-claude --model claude-sonnet-4-5
 pi --provider cc-switch-claude --model claude-opus-4-7
 ```
 
+也可以直接启动 Pi：
+
+```powershell
+pi
+```
+
 在 Pi 内部可运行：
 
 ```text
 /cc-switch
+/model
 ```
 
 ### 可选快捷命令
