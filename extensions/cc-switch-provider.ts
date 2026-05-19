@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
 import {
 	type Api,
 	type AssistantMessage,
@@ -55,14 +56,21 @@ type StreamBlock =
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const TEXT_INPUT = ["text"] as ("text" | "image")[];
 const TEXT_IMAGE_INPUT = ["text", "image"] as ("text" | "image")[];
+// pi-ai 官方模型表确认：4-6 / 4-7 才是 1M 上下文，4-5 及之前仍是 200K。
+// 不要写 "claude-sonnet-4" 这种无后缀别名——Anthropic 真实 alias 是 -0 结尾，直接写裸名会被网关 404。
 const DEFAULT_CLAUDE_MODELS = [
 	"claude-opus-4-7",
 	"claude-opus-4-6",
 	"claude-sonnet-4-6",
 	"claude-opus-4-5",
 	"claude-sonnet-4-5",
-	"claude-sonnet-4",
-	"claude-opus-4",
+];
+// 1M 上下文模型白名单：仅列 pi-ai models.generated.js 中 contextWindow=1000000 的条目，
+// 允许带版本/日期后缀（如 "claude-opus-4-6-v1" / "claude-opus-4-7-20251201"）。
+const ONE_MILLION_CONTEXT_MODEL_PREFIXES = [
+	"claude-sonnet-4-6",
+	"claude-opus-4-6",
+	"claude-opus-4-7",
 ];
 const CONTEXT_1M_BETA = "context-1m-2025-08-07";
 const CLAUDE_CODE_BETAS = [
@@ -72,10 +80,44 @@ const CLAUDE_CODE_BETAS = [
 	"effort-2025-11-24",
 ];
 
+// 加载阶段的诊断信息：扩展启动时没有 ctx，缓存到模块状态，等首个 session_start 再 notify。
+const loadDiagnostics: { claude?: string; codex?: string } = {};
+
+// 中转网关上下文溢出文案归一化模式。pi 只识别少数标准文案才会触发自动 compact 重试，
+// 这里把常见几类映射成 "context_length_exceeded"。负向列表避免误把限流/配额当成溢出。
+const CLAUDE_OVERFLOW_PATTERNS = [
+	/prompt is too long/i,
+	/input length .{0,40}exceeds? .{0,40}(context|token)/i,
+	/exceeds? .{0,40}(context|token) (length|window|limit)/i,
+	/context (length|window) exceeded/i,
+	/maximum context length/i,
+	/too many input tokens/i,
+	/token limit exceeded/i,
+	/上下文.{0,4}(过长|超出|超过)/,
+	/超出.{0,4}(上下文|长度限制)/,
+];
+const CLAUDE_OVERFLOW_NEGATIVE_PATTERNS = [
+	/rate limit/i,
+	/too many requests/i,
+	/quota/i,
+	/insufficient (balance|credit|funds|quota)/i,
+	/payment required/i,
+];
+
+/**
+ * 安全读取 JSON 对象：文件不存在、解析失败、根节点非对象都返回 undefined。
+ *
+ * cc-switch 用「写临时文件 + rename」做原子写入，但用户也可能手动编辑配置文件，
+ * 遇到非法 JSON 时扩展应当静默退化而不是整体崩。
+ */
 function readJsonObject(filePath: string): Record<string, unknown> | undefined {
 	if (!existsSync(filePath)) return undefined;
-	const parsed = JSON.parse(readFileSync(filePath, "utf8")) as unknown;
-	return isRecord(parsed) ? parsed : undefined;
+	try {
+		const parsed = JSON.parse(readFileSync(filePath, "utf8")) as unknown;
+		return isRecord(parsed) ? parsed : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -102,68 +144,237 @@ function uniqueStrings(values: string[]): string[] {
 	return Array.from(new Set(values));
 }
 
-function loadClaudeConfig(): ClaudeConfig | undefined {
-	const settings = readJsonObject(join(homedir(), ".claude", "settings.json"));
-	const env = isRecord(settings?.env) ? settings.env : undefined;
-	if (!env) return undefined;
+// ============================================================
+// 数据提取层（纯函数）
+//
+// 把"从 env / settings_config 对象提取 Claude/Codex 配置"剥离成纯函数，
+// 让两条数据源共享同一套提取逻辑：
+//   - live-file 路径：读 ~/.claude/settings.json / ~/.codex/* → 进对应纯函数
+//   - SQLite 路径：读 ~/.cc-switch/cc-switch.db 的 settings_config JSON → 进同一套纯函数
+// ============================================================
 
+type ExtractResult<T> = { ok: true; config: T } | { ok: false; error: string };
+
+function extractClaudeFromEnv(env: Record<string, unknown>): ExtractResult<ClaudeConfig> {
 	const baseUrl = stringValue(env.ANTHROPIC_BASE_URL);
 	const authToken = stringValue(env.ANTHROPIC_AUTH_TOKEN);
 	const apiKey = stringValue(env.ANTHROPIC_API_KEY);
-	if (!baseUrl || (!authToken && !apiKey)) return undefined;
+	if (!baseUrl) return { ok: false, error: "env.ANTHROPIC_BASE_URL missing" };
+	if (!authToken && !apiKey) {
+		return { ok: false, error: "neither env.ANTHROPIC_AUTH_TOKEN nor env.ANTHROPIC_API_KEY is set" };
+	}
 
 	return {
-		baseUrl,
-		apiKey: authToken ?? apiKey ?? "",
-		authKind: authToken ? "bearer" : "api-key",
-		models: uniqueStrings([
-			...splitModelList(env.PI_CC_SWITCH_CLAUDE_MODELS),
-			stringValue(env.ANTHROPIC_MODEL) ??
-				stringValue(env.ANTHROPIC_DEFAULT_SONNET_MODEL) ??
-				stringValue(env.ANTHROPIC_DEFAULT_OPUS_MODEL) ??
-				"claude-sonnet-4-5",
-			...DEFAULT_CLAUDE_MODELS,
-		]),
+		ok: true,
+		config: {
+			baseUrl,
+			apiKey: (authToken ?? apiKey) as string,
+			authKind: authToken ? "bearer" : "api-key",
+			models: uniqueStrings([
+				...splitModelList(env.PI_CC_SWITCH_CLAUDE_MODELS),
+				stringValue(env.ANTHROPIC_MODEL) ??
+					stringValue(env.ANTHROPIC_DEFAULT_SONNET_MODEL) ??
+					stringValue(env.ANTHROPIC_DEFAULT_OPUS_MODEL) ??
+					"claude-sonnet-4-5",
+				...DEFAULT_CLAUDE_MODELS,
+			]),
+		},
 	};
 }
 
-function matchTomlString(text: string, field: string): string | undefined {
-	const escaped = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	const match = text.match(new RegExp(`^\\s*${escaped}\\s*=\\s*["']([^"']+)["']`, "m"));
-	return match?.[1]?.trim();
+function extractCodexFromConfigText(apiKey: string, configText: string): ExtractResult<CodexConfig> {
+	const toml = parseCodexConfigToml(configText);
+	// cc-switch 的格式：顶层 `model_provider = "<id>"` 指向 `[model_providers.<id>]` section。
+	// 优先按 section 取 base_url / wire_api，回退到顶层（兼容用户手写的扁平 config）。
+	const activeProviderId = toml.top.model_provider;
+	const section = activeProviderId
+		? toml.sections[`model_providers.${activeProviderId}`]
+		: undefined;
+	const baseUrl = section?.base_url ?? toml.top.base_url;
+	const wireApi = section?.wire_api ?? toml.top.wire_api;
+	const model = toml.top.model;
+
+	if (!baseUrl) {
+		return {
+			ok: false,
+			error: activeProviderId
+				? `[model_providers.${activeProviderId}].base_url missing`
+				: "top-level base_url missing",
+		};
+	}
+	if (!model) {
+		return { ok: false, error: "top-level 'model' missing" };
+	}
+
+	return {
+		ok: true,
+		config: {
+			baseUrl,
+			apiKey,
+			api: wireApi === "chat" ? "openai-completions" : "openai-responses",
+			model,
+		},
+	};
+}
+
+function loadClaudeConfig(): ClaudeConfig | undefined {
+	const settingsPath = join(homedir(), ".claude", "settings.json");
+	if (!existsSync(settingsPath)) {
+		loadDiagnostics.claude = `Claude: ~/.claude/settings.json not found, skip provider registration`;
+		return undefined;
+	}
+	const settings = readJsonObject(settingsPath);
+	if (!settings) {
+		loadDiagnostics.claude = `Claude: ~/.claude/settings.json is unreadable or not a JSON object`;
+		return undefined;
+	}
+	const env = isRecord(settings.env) ? settings.env : undefined;
+	if (!env) {
+		loadDiagnostics.claude = `Claude: ~/.claude/settings.json missing 'env' object`;
+		return undefined;
+	}
+	const result = extractClaudeFromEnv(env);
+	if (!result.ok) {
+		loadDiagnostics.claude = `Claude: ${result.error}`;
+		return undefined;
+	}
+	return result.config;
+}
+
+/**
+ * 极简 section-aware TOML 解析器，专为 cc-switch 写出来的 ~/.codex/config.toml 设计。
+ *
+ * 仅覆盖 cc-switch 实际产物的语法子集：
+ *   - key = "value" / 'value'（含基本反斜杠转义）
+ *   - key = true|false|number（按字符串保留）
+ *   - [section.subsection] 形式的多段 section header
+ *   - # 行注释
+ *
+ * 故意不实现数组、内联表、多行字符串——cc-switch 的 codex provider 写入里不会出现这些。
+ */
+function parseCodexConfigToml(text: string): {
+	top: Record<string, string>;
+	sections: Record<string, Record<string, string>>;
+} {
+	const top: Record<string, string> = {};
+	const sections: Record<string, Record<string, string>> = {};
+	let currentSection: string | undefined;
+
+	for (const rawLine of text.split(/\r?\n/)) {
+		const line = rawLine.replace(/^\uFEFF/, "").trim();
+		if (!line || line.startsWith("#")) continue;
+
+		const sectionMatch = line.match(/^\[([^\]]+)\]\s*(#.*)?$/);
+		if (sectionMatch) {
+			currentSection = sectionMatch[1].trim();
+			if (!sections[currentSection]) sections[currentSection] = {};
+			continue;
+		}
+
+		const kvMatch = line.match(/^([A-Za-z0-9_\-.]+)\s*=\s*(.+?)\s*(#.*)?$/);
+		if (!kvMatch) continue;
+		const key = kvMatch[1].trim();
+		const value = parseCodexTomlScalar(kvMatch[2].trim());
+		if (value === undefined) continue;
+
+		if (currentSection) sections[currentSection][key] = value;
+		else top[key] = value;
+	}
+
+	return { top, sections };
+}
+
+function parseCodexTomlScalar(raw: string): string | undefined {
+	if (raw.length === 0) return undefined;
+	const first = raw[0];
+	if (first === '"') {
+		// 双引号字符串支持基本反斜杠转义。
+		let result = "";
+		let escaped = false;
+		for (let i = 1; i < raw.length; i += 1) {
+			const ch = raw[i];
+			if (escaped) {
+				if (ch === "n") result += "\n";
+				else if (ch === "t") result += "\t";
+				else if (ch === "r") result += "\r";
+				else result += ch;
+				escaped = false;
+				continue;
+			}
+			if (ch === "\\") {
+				escaped = true;
+				continue;
+			}
+			if (ch === '"') return result;
+			result += ch;
+		}
+		return undefined;
+	}
+	if (first === "'") {
+		// 单引号字面量字符串（TOML literal string）。
+		const endIndex = raw.indexOf("'", 1);
+		if (endIndex < 0) return undefined;
+		return raw.slice(1, endIndex);
+	}
+	// 裸值：true/false/number，按原文返回即可。
+	return raw;
 }
 
 function loadCodexConfig(): CodexConfig | undefined {
-	const auth = readJsonObject(join(homedir(), ".codex", "auth.json"));
-	const apiKey = stringValue(auth?.OPENAI_API_KEY);
+	const authPath = join(homedir(), ".codex", "auth.json");
 	const configPath = join(homedir(), ".codex", "config.toml");
-	if (!apiKey || !existsSync(configPath)) return undefined;
 
-	const configText = readFileSync(configPath, "utf8");
-	const baseUrl = matchTomlString(configText, "base_url");
-	if (!baseUrl) return undefined;
+	if (!existsSync(authPath)) {
+		loadDiagnostics.codex = `Codex: ~/.codex/auth.json not found, skip provider registration`;
+		return undefined;
+	}
+	const auth = readJsonObject(authPath);
+	const apiKey = stringValue(auth?.OPENAI_API_KEY);
+	if (!apiKey) {
+		loadDiagnostics.codex = `Codex: ~/.codex/auth.json missing OPENAI_API_KEY`;
+		return undefined;
+	}
+	if (!existsSync(configPath)) {
+		loadDiagnostics.codex = `Codex: ~/.codex/config.toml not found`;
+		return undefined;
+	}
 
-	const wireApi = matchTomlString(configText, "wire_api");
-	return {
-		baseUrl,
-		apiKey,
-		api: wireApi === "chat" ? "openai-completions" : "openai-responses",
-		model: matchTomlString(configText, "model") ?? "gpt-5.5",
-	};
+	let configText: string;
+	try {
+		configText = readFileSync(configPath, "utf8");
+	} catch (error) {
+		loadDiagnostics.codex = `Codex: cannot read config.toml: ${(error as Error).message}`;
+		return undefined;
+	}
+
+	const result = extractCodexFromConfigText(apiKey, configText);
+	if (!result.ok) {
+		loadDiagnostics.codex = `Codex: ${result.error} in config.toml`;
+		return undefined;
+	}
+	return result.config;
 }
 
 function endpointForAnthropicMessages(baseUrl: string): string {
+	// Anthropic 与多数中转都通过 `anthropic-beta` header 协商 beta 特性，不需要 `?beta=true` query；
+	// 部分网关甚至会因为这个参数把 URL 误判成非法。
 	const trimmed = baseUrl.replace(/\/+$/, "");
-	const endpoint = (() => {
-		if (/\/v\d+\/messages$/.test(trimmed)) return trimmed;
-		if (/\/v\d+$/.test(trimmed)) return `${trimmed}/messages`;
-		return `${trimmed}/v1/messages`;
-	})();
-	return `${endpoint}?beta=true`;
+	if (/\/v\d+\/messages$/.test(trimmed)) return trimmed;
+	if (/\/v\d+$/.test(trimmed)) return `${trimmed}/messages`;
+	return `${trimmed}/v1/messages`;
 }
 
+/**
+ * 是否为支持 1M 上下文 + Claude Code beta 的模型。
+ *
+ * 数据来源：@earendil-works/pi-ai 的 models.generated.js 中 contextWindow=1000000 的 anthropic-messages 条目。
+ * 当前只有 4-6 / 4-7 系列；4-5 及更早仍是 200K，不要在 4-5 上开 1M beta 否则会被网关拒掉。
+ * 允许带版本/日期后缀（如 "claude-opus-4-7-20251201" / "claude-opus-4-6-v1"）。
+ */
 function supportsOneMillionContext(modelId: string): boolean {
-	return /^claude-(opus|sonnet)-4(?:-\d+)?(?:-\d+)?$/.test(modelId);
+	return ONE_MILLION_CONTEXT_MODEL_PREFIXES.some(
+		(prefix) => modelId === prefix || modelId.startsWith(`${prefix}-`),
+	);
 }
 
 function anthropicBetaHeader(modelId: string): string | undefined {
@@ -344,6 +555,8 @@ function buildAnthropicPayload(
 		stream: true,
 	};
 
+	// system block 全部挂 ephemeral cache_control —— 200K 模型同样支持 prompt caching，
+	// 不缓存会让长会话每轮重复计费。Claude Code 身份伪装行只在 1M 模型上加（与 Anthropic CLI 行为一致）。
 	const systemBlocks: Record<string, unknown>[] = [];
 	if (supportsOneMillionContext(model.id)) {
 		systemBlocks.push({
@@ -709,14 +922,15 @@ export default function (pi: ExtensionAPI) {
 				id: model,
 				name: `cc-switch Claude (${model})`,
 				reasoning: true,
-				// 仅 1M 上下文模型暴露 xhigh 档；其他模型让 pi 的 UI 自动隐藏 xhigh。
+				// 仅 1M 上下文模型暴露 xhigh 档；其他模型让 pi UI 自动隐藏 xhigh。
 				thinkingLevelMap: supportsOneMillionContext(model) ? { xhigh: "xhigh" } : undefined,
 				input: TEXT_IMAGE_INPUT,
 				cost: ZERO_COST,
 				contextWindow: claudeContextWindow(model),
 				maxTokens: 64000,
 			})),
-			streamSimple: (model, context, options) => streamCcSwitchAnthropic(claude.authKind, model, context, options),
+			streamSimple: (model, context, options) =>
+				streamCcSwitchAnthropic(claude.authKind, model, context, options),
 		});
 	}
 
@@ -748,12 +962,51 @@ export default function (pi: ExtensionAPI) {
 			const lines = [
 				claude
 					? `Claude: ${claude.models.map((model) => `cc-switch-claude/${model}`).join(", ")} -> ${claude.baseUrl}`
-					: "Claude: no ~/.claude/settings.json provider found",
+					: loadDiagnostics.claude ?? "Claude: no ~/.claude/settings.json provider found",
 				codex
 					? `Codex: cc-switch-codex/${codex.model} -> ${codex.baseUrl}`
-					: "Codex: no ~/.codex provider found",
+					: loadDiagnostics.codex ?? "Codex: no ~/.codex provider found",
 			];
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
+	});
+
+	// 加载阶段没有 ctx，等到首个 session_start 把诊断 notify 出来。
+	// 仅当至少一侧没注册成功时才打扰用户，避免每次开会话弹「全部正常」。
+	if (loadDiagnostics.claude || loadDiagnostics.codex) {
+		let reported = false;
+		pi.on("session_start", (_event, ctx) => {
+			if (reported) return;
+			reported = true;
+			const pieces: string[] = [];
+			if (loadDiagnostics.claude) pieces.push(loadDiagnostics.claude);
+			if (loadDiagnostics.codex) pieces.push(loadDiagnostics.codex);
+			ctx.ui.notify(
+				`cc-switch-provider: some providers were not registered.\n${pieces.join("\n")}\nRun /cc-switch to inspect.`,
+				"warning",
+			);
+		});
+	}
+
+	// Overflow 归一化：中转网关溢出文案各异，把它们改写成 pi 能识别的 "context_length_exceeded"，
+	// 让 pi 自动 compact 重试。仅对 cc-switch-claude / cc-switch-codex 生效，避免污染其他 provider。
+	pi.on("message_end", (event) => {
+		const message = event.message;
+		if (message.role !== "assistant") return;
+		if (message.stopReason !== "error") return;
+		if (message.provider !== "cc-switch-claude" && message.provider !== "cc-switch-codex") return;
+
+		const errorMessage = message.errorMessage ?? "";
+		if (!errorMessage) return;
+		if (errorMessage.includes("context_length_exceeded")) return; // 已是规范文案，幂等跳过
+		if (CLAUDE_OVERFLOW_NEGATIVE_PATTERNS.some((pattern) => pattern.test(errorMessage))) return;
+		if (!CLAUDE_OVERFLOW_PATTERNS.some((pattern) => pattern.test(errorMessage))) return;
+
+		return {
+			message: {
+				...message,
+				errorMessage: `context_length_exceeded: ${errorMessage}`,
+			},
+		};
 	});
 }
