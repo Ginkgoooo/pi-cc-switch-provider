@@ -22,177 +22,173 @@ npm install -g @earendil-works/pi-coding-agent
 
 ### Install
 
+| Command | Purpose |
+|---|---|
+| `pi install git:github.com/Ginkgoooo/pi-cc-switch-provider` | Install this extension from GitHub. |
+
 ```powershell
 pi install git:github.com/Ginkgoooo/pi-cc-switch-provider
 ```
 
 ### cc-switch Provider Commands
 
-List all cc-switch models:
+| Command | Purpose |
+|---|---|
+| `pi --list-models cc-switch` | List all models registered by this extension. |
+| `pi` | Start Pi directly. After startup, use `/model` to select a cc-switch model. |
+| `pi --provider cc-switch-codex --model gpt-5.5` | Start Pi with the Codex provider imported from cc-switch. Replace the model with the one shown by `pi --list-models cc-switch` if needed. |
+| `pi --provider cc-switch-claude --model claude-sonnet-4-5` | Start Pi with the Claude provider and the `claude-sonnet-4-5` model imported from cc-switch. |
+| `pi --provider cc-switch-claude --model claude-opus-4-7` | Start Pi with the Claude provider and the `claude-opus-4-7` model imported from cc-switch. |
+| `/cc-switch` | Show the import status of cc-switch Codex and Claude providers inside Pi. |
+| `/model` | Pi built-in command for selecting or switching models inside Pi. |
+
+Examples:
 
 ```powershell
 pi --list-models cc-switch
-```
-
-Start Pi directly, then select a model inside Pi:
-
-```powershell
 pi
-```
-
-```text
-/model
-```
-
-Start Pi with the active Codex model imported from cc-switch:
-
-```powershell
 pi --provider cc-switch-codex --model gpt-5.5
-```
-
-Start Pi with a specific Claude model imported from cc-switch:
-
-```powershell
 pi --provider cc-switch-claude --model claude-sonnet-4-5
 pi --provider cc-switch-claude --model claude-opus-4-7
 ```
 
-Show cc-switch provider import status inside Pi:
+Inside Pi:
 
 ```text
 /cc-switch
+/model
 ```
 
 ### Pi Built-in CLI Commands
 
 General syntax:
 
-```bash
-pi [options] [@files...] [messages...]
-```
+| Command | Purpose |
+|---|---|
+| `pi [options] [@files...] [messages...]` | Start Pi with optional flags, file references, and an initial prompt. |
 
 Package commands:
 
-```bash
-pi install <source> [-l]
-pi remove <source> [-l]
-pi uninstall <source> [-l]
-pi update [source|self|pi]
-pi update --extensions
-pi update --self
-pi update --extension <src>
-pi list
-pi config
-```
+| Command | Purpose |
+|---|---|
+| `pi install <source> [-l]` | Install a Pi package. Use `-l` for project-local installation. |
+| `pi remove <source> [-l]` | Remove an installed Pi package. Use `-l` for project-local removal. |
+| `pi uninstall <source> [-l]` | Alias of `pi remove`. |
+| `pi update [source\|self\|pi]` | Update Pi and packages, or update a specific source. |
+| `pi update --extensions` | Update installed packages only. |
+| `pi update --self` | Update Pi itself only. |
+| `pi update --extension <src>` | Update one specific package. |
+| `pi list` | List installed Pi packages. |
+| `pi config` | Enable or disable package resources. |
 
 Modes:
 
-```bash
-pi
-pi -p "Summarize this codebase"
-pi --print "Summarize this codebase"
-pi --mode json
-pi --mode rpc
-pi --export <in> [out]
-```
+| Command | Purpose |
+|---|---|
+| `pi` | Start interactive mode. |
+| `pi -p "Summarize this codebase"` | Print a single response and exit. |
+| `pi --print "Summarize this codebase"` | Same as `pi -p`. |
+| `pi --mode json` | Output events as JSON lines. Useful for scripts. |
+| `pi --mode rpc` | Start RPC mode over stdin/stdout. Useful for integrations. |
+| `pi --export <in> [out]` | Export a saved session to HTML. |
 
 Model options:
 
-```bash
-pi --provider <name>
-pi --model <pattern>
-pi --api-key <key>
-pi --thinking <off|minimal|low|medium|high|xhigh>
-pi --models <patterns>
-pi --list-models [search]
-```
+| Command | Purpose |
+|---|---|
+| `pi --provider <name>` | Select a provider, such as `cc-switch-codex` or `cc-switch-claude`. |
+| `pi --model <pattern>` | Select a model by ID or pattern. Supports `provider/id` and optional `:<thinking>`. |
+| `pi --api-key <key>` | Override the API key for the selected provider. |
+| `pi --thinking <off\|minimal\|low\|medium\|high\|xhigh>` | Set the thinking level. |
+| `pi --models <patterns>` | Set comma-separated model patterns for Ctrl+P model cycling. |
+| `pi --list-models [search]` | List available models, optionally filtered by search text. |
 
 Session options:
 
-```bash
-pi -c
-pi --continue
-pi -r
-pi --resume
-pi --session <path|id>
-pi --fork <path|id>
-pi --session-dir <dir>
-pi --no-session
-```
+| Command | Purpose |
+|---|---|
+| `pi -c` | Continue the most recent session. |
+| `pi --continue` | Same as `pi -c`. |
+| `pi -r` | Browse and select a previous session. |
+| `pi --resume` | Same as `pi -r`. |
+| `pi --session <path\|id>` | Open a specific session file or session ID. |
+| `pi --fork <path\|id>` | Fork a session into a new session file. |
+| `pi --session-dir <dir>` | Use a custom session storage directory. |
+| `pi --no-session` | Start ephemeral mode and do not save the session. |
 
 Tool options:
 
-```bash
-pi --tools <list>
-pi -t <list>
-pi --no-builtin-tools
-pi -nbt
-pi --no-tools
-pi -nt
-```
+| Command | Purpose |
+|---|---|
+| `pi --tools <list>` | Allow only the specified tools. |
+| `pi -t <list>` | Same as `pi --tools`. |
+| `pi --no-builtin-tools` | Disable built-in tools, while keeping extension and custom tools enabled. |
+| `pi -nbt` | Same as `pi --no-builtin-tools`. |
+| `pi --no-tools` | Disable all tools. |
+| `pi -nt` | Same as `pi --no-tools`. |
 
 Built-in tools include `read`, `bash`, `edit`, `write`, `grep`, `find`, and `ls`.
 
 Resource options:
 
-```bash
-pi --extension <source>
-pi -e <source>
-pi --no-extensions
-pi --skill <path>
-pi --no-skills
-pi --prompt-template <path>
-pi --no-prompt-templates
-pi --theme <path>
-pi --no-themes
-pi --no-context-files
-pi -nc
-```
+| Command | Purpose |
+|---|---|
+| `pi --extension <source>` | Load an extension from a path, npm package, or git source. |
+| `pi -e <source>` | Same as `pi --extension`. |
+| `pi --no-extensions` | Disable extension discovery. |
+| `pi --skill <path>` | Load a skill from a path. |
+| `pi --no-skills` | Disable skill discovery. |
+| `pi --prompt-template <path>` | Load a prompt template from a path. |
+| `pi --no-prompt-templates` | Disable prompt template discovery. |
+| `pi --theme <path>` | Load a theme from a path. |
+| `pi --no-themes` | Disable theme discovery. |
+| `pi --no-context-files` | Disable `AGENTS.md` and `CLAUDE.md` discovery. |
+| `pi -nc` | Same as `pi --no-context-files`. |
 
 Other options:
 
-```bash
-pi --system-prompt <text>
-pi --append-system-prompt <text>
-pi --verbose
-pi --help
-pi -h
-pi --version
-pi -v
-```
+| Command | Purpose |
+|---|---|
+| `pi --system-prompt <text>` | Replace the default system prompt. |
+| `pi --append-system-prompt <text>` | Append text to the system prompt. |
+| `pi --verbose` | Force verbose startup output. |
+| `pi --help` | Show help. |
+| `pi -h` | Same as `pi --help`. |
+| `pi --version` | Show Pi version. |
+| `pi -v` | Same as `pi --version`. |
 
 File arguments:
 
-```bash
-pi @prompt.md "Answer this"
-pi -p @screenshot.png "What's in this image?"
-pi @code.ts @test.ts "Review these files"
-```
+| Command | Purpose |
+|---|---|
+| `pi @prompt.md "Answer this"` | Include `prompt.md` in the initial message. |
+| `pi -p @screenshot.png "What's in this image?"` | Include an image in print mode. |
+| `pi @code.ts @test.ts "Review these files"` | Include multiple files in the initial message. |
 
 ### Pi Built-in Slash Commands
 
-```text
-/login
-/logout
-/model
-/scoped-models
-/settings
-/resume
-/new
-/name <name>
-/session
-/tree
-/fork
-/clone
-/compact [prompt]
-/copy
-/export [file]
-/share
-/reload
-/hotkeys
-/changelog
-/quit
-```
+| Command | Purpose |
+|---|---|
+| `/login` | Manage OAuth or API-key login. |
+| `/logout` | Log out or remove credentials. |
+| `/model` | Switch models. |
+| `/scoped-models` | Enable or disable models for Ctrl+P cycling. |
+| `/settings` | Open settings for thinking level, theme, message delivery, and transport. |
+| `/resume` | Pick from previous sessions. |
+| `/new` | Start a new session. |
+| `/name <name>` | Set the current session display name. |
+| `/session` | Show session file, ID, messages, tokens, and cost. |
+| `/tree` | Jump to any point in the session tree and continue from there. |
+| `/fork` | Create a new session from a previous user message. |
+| `/clone` | Duplicate the current active branch into a new session. |
+| `/compact [prompt]` | Manually compact context, optionally with custom instructions. |
+| `/copy` | Copy the last assistant message to clipboard. |
+| `/export [file]` | Export the session to HTML. |
+| `/share` | Upload the session as a private GitHub gist with a shareable HTML link. |
+| `/reload` | Reload keybindings, extensions, skills, prompts, and context files. |
+| `/hotkeys` | Show all keyboard shortcuts. |
+| `/changelog` | Display Pi version history. |
+| `/quit` | Quit Pi. |
 
 ### Optional Shortcuts
 
@@ -202,21 +198,11 @@ Install shortcut commands:
 powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 ```
 
-Then use:
-
-```powershell
-pi-models
-pi-codex
-pi-claude
-```
-
-The shortcuts expand to:
-
-```powershell
-pi-models  # pi --list-models cc-switch
-pi-codex   # pi --provider cc-switch-codex --model gpt-5.5
-pi-claude  # pi --provider cc-switch-claude --model claude-sonnet-4-5
-```
+| Shortcut | Expands to | Purpose |
+|---|---|---|
+| `pi-models` | `pi --list-models cc-switch` | List cc-switch models quickly. |
+| `pi-codex` | `pi --provider cc-switch-codex --model gpt-5.5` | Start Pi with the cc-switch Codex provider quickly. |
+| `pi-claude` | `pi --provider cc-switch-claude --model claude-sonnet-4-5` | Start Pi with the cc-switch Claude provider quickly. |
 
 ### Claude Models
 
@@ -225,10 +211,10 @@ The extension registers several common Claude model IDs because cc-switch provid
 Default Claude model IDs include:
 
 - `claude-opus-4-7`
+- `claude-opus-4-6`
+- `claude-sonnet-4-6`
 - `claude-opus-4-5`
 - `claude-sonnet-4-5`
-- `claude-sonnet-4`
-- `claude-opus-4`
 
 To override or add models, set `PI_CC_SWITCH_CLAUDE_MODELS` in cc-switch's Claude env config as a comma- or space-separated list.
 
@@ -260,177 +246,173 @@ npm install -g @earendil-works/pi-coding-agent
 
 ### 安装
 
+| 命令 | 作用 |
+|---|---|
+| `pi install git:github.com/Ginkgoooo/pi-cc-switch-provider` | 从 GitHub 安装本扩展。 |
+
 ```powershell
 pi install git:github.com/Ginkgoooo/pi-cc-switch-provider
 ```
 
 ### cc-switch Provider 命令
 
-列出所有 cc-switch 模型：
+| 命令 | 作用 |
+|---|---|
+| `pi --list-models cc-switch` | 列出本扩展注册的所有 cc-switch 模型。 |
+| `pi` | 直接启动 Pi。启动后可在 Pi 内使用 `/model` 选择 cc-switch 模型。 |
+| `pi --provider cc-switch-codex --model gpt-5.5` | 使用 cc-switch 导入的 Codex provider 启动 Pi。如实际模型不同，可替换为 `pi --list-models cc-switch` 显示的模型。 |
+| `pi --provider cc-switch-claude --model claude-sonnet-4-5` | 使用 cc-switch 导入的 Claude provider 和 `claude-sonnet-4-5` 模型启动 Pi。 |
+| `pi --provider cc-switch-claude --model claude-opus-4-7` | 使用 cc-switch 导入的 Claude provider 和 `claude-opus-4-7` 模型启动 Pi。 |
+| `/cc-switch` | 在 Pi 内查看 cc-switch Codex 和 Claude provider 的导入状态。 |
+| `/model` | Pi 内置命令，用于在 Pi 内选择或切换模型。 |
+
+示例：
 
 ```powershell
 pi --list-models cc-switch
-```
-
-直接启动 Pi，然后在 Pi 内选择模型：
-
-```powershell
 pi
-```
-
-```text
-/model
-```
-
-使用 cc-switch 导入的当前 Codex 模型启动 Pi：
-
-```powershell
 pi --provider cc-switch-codex --model gpt-5.5
-```
-
-使用 cc-switch 导入的指定 Claude 模型启动 Pi：
-
-```powershell
 pi --provider cc-switch-claude --model claude-sonnet-4-5
 pi --provider cc-switch-claude --model claude-opus-4-7
 ```
 
-在 Pi 内查看 cc-switch provider 导入状态：
+在 Pi 内运行：
 
 ```text
 /cc-switch
+/model
 ```
 
 ### Pi 内置 CLI 命令
 
 通用语法：
 
-```bash
-pi [options] [@files...] [messages...]
-```
+| 命令 | 作用 |
+|---|---|
+| `pi [options] [@files...] [messages...]` | 启动 Pi，可附带参数、文件引用和初始提示词。 |
 
 包管理命令：
 
-```bash
-pi install <source> [-l]
-pi remove <source> [-l]
-pi uninstall <source> [-l]
-pi update [source|self|pi]
-pi update --extensions
-pi update --self
-pi update --extension <src>
-pi list
-pi config
-```
+| 命令 | 作用 |
+|---|---|
+| `pi install <source> [-l]` | 安装 Pi 包。使用 `-l` 表示安装到当前项目。 |
+| `pi remove <source> [-l]` | 移除已安装的 Pi 包。使用 `-l` 表示从当前项目移除。 |
+| `pi uninstall <source> [-l]` | `pi remove` 的别名。 |
+| `pi update [source\|self\|pi]` | 更新 Pi 和包，或更新指定来源。 |
+| `pi update --extensions` | 只更新已安装的包。 |
+| `pi update --self` | 只更新 Pi 自身。 |
+| `pi update --extension <src>` | 更新指定的某一个包。 |
+| `pi list` | 列出已安装的 Pi 包。 |
+| `pi config` | 启用或禁用包资源。 |
 
 运行模式：
 
-```bash
-pi
-pi -p "Summarize this codebase"
-pi --print "Summarize this codebase"
-pi --mode json
-pi --mode rpc
-pi --export <in> [out]
-```
+| 命令 | 作用 |
+|---|---|
+| `pi` | 启动交互模式。 |
+| `pi -p "Summarize this codebase"` | 输出一次回答后退出。 |
+| `pi --print "Summarize this codebase"` | 等同于 `pi -p`。 |
+| `pi --mode json` | 以 JSON lines 输出事件，适合脚本处理。 |
+| `pi --mode rpc` | 通过 stdin/stdout 启动 RPC 模式，适合集成。 |
+| `pi --export <in> [out]` | 将已保存会话导出为 HTML。 |
 
 模型选项：
 
-```bash
-pi --provider <name>
-pi --model <pattern>
-pi --api-key <key>
-pi --thinking <off|minimal|low|medium|high|xhigh>
-pi --models <patterns>
-pi --list-models [search]
-```
+| 命令 | 作用 |
+|---|---|
+| `pi --provider <name>` | 选择 provider，例如 `cc-switch-codex` 或 `cc-switch-claude`。 |
+| `pi --model <pattern>` | 按 ID 或匹配模式选择模型，支持 `provider/id` 和可选的 `:<thinking>`。 |
+| `pi --api-key <key>` | 为当前 provider 覆盖 API key。 |
+| `pi --thinking <off\|minimal\|low\|medium\|high\|xhigh>` | 设置 thinking 等级。 |
+| `pi --models <patterns>` | 设置 Ctrl+P 循环切换模型使用的逗号分隔匹配模式。 |
+| `pi --list-models [search]` | 列出可用模型，可附带搜索词过滤。 |
 
 会话选项：
 
-```bash
-pi -c
-pi --continue
-pi -r
-pi --resume
-pi --session <path|id>
-pi --fork <path|id>
-pi --session-dir <dir>
-pi --no-session
-```
+| 命令 | 作用 |
+|---|---|
+| `pi -c` | 继续最近一次会话。 |
+| `pi --continue` | 等同于 `pi -c`。 |
+| `pi -r` | 浏览并选择历史会话。 |
+| `pi --resume` | 等同于 `pi -r`。 |
+| `pi --session <path\|id>` | 打开指定会话文件或会话 ID。 |
+| `pi --fork <path\|id>` | 将指定会话 fork 为一个新的会话文件。 |
+| `pi --session-dir <dir>` | 使用自定义会话存储目录。 |
+| `pi --no-session` | 启动临时模式，不保存会话。 |
 
 工具选项：
 
-```bash
-pi --tools <list>
-pi -t <list>
-pi --no-builtin-tools
-pi -nbt
-pi --no-tools
-pi -nt
-```
+| 命令 | 作用 |
+|---|---|
+| `pi --tools <list>` | 只允许使用指定工具。 |
+| `pi -t <list>` | 等同于 `pi --tools`。 |
+| `pi --no-builtin-tools` | 禁用内置工具，但保留扩展和自定义工具。 |
+| `pi -nbt` | 等同于 `pi --no-builtin-tools`。 |
+| `pi --no-tools` | 禁用全部工具。 |
+| `pi -nt` | 等同于 `pi --no-tools`。 |
 
 内置工具包括 `read`、`bash`、`edit`、`write`、`grep`、`find` 和 `ls`。
 
 资源选项：
 
-```bash
-pi --extension <source>
-pi -e <source>
-pi --no-extensions
-pi --skill <path>
-pi --no-skills
-pi --prompt-template <path>
-pi --no-prompt-templates
-pi --theme <path>
-pi --no-themes
-pi --no-context-files
-pi -nc
-```
+| 命令 | 作用 |
+|---|---|
+| `pi --extension <source>` | 从路径、npm 包或 git 来源加载扩展。 |
+| `pi -e <source>` | 等同于 `pi --extension`。 |
+| `pi --no-extensions` | 禁用扩展发现。 |
+| `pi --skill <path>` | 从路径加载 skill。 |
+| `pi --no-skills` | 禁用 skill 发现。 |
+| `pi --prompt-template <path>` | 从路径加载提示词模板。 |
+| `pi --no-prompt-templates` | 禁用提示词模板发现。 |
+| `pi --theme <path>` | 从路径加载主题。 |
+| `pi --no-themes` | 禁用主题发现。 |
+| `pi --no-context-files` | 禁用 `AGENTS.md` 和 `CLAUDE.md` 自动发现。 |
+| `pi -nc` | 等同于 `pi --no-context-files`。 |
 
 其他选项：
 
-```bash
-pi --system-prompt <text>
-pi --append-system-prompt <text>
-pi --verbose
-pi --help
-pi -h
-pi --version
-pi -v
-```
+| 命令 | 作用 |
+|---|---|
+| `pi --system-prompt <text>` | 替换默认系统提示词。 |
+| `pi --append-system-prompt <text>` | 向系统提示词追加内容。 |
+| `pi --verbose` | 强制输出详细启动信息。 |
+| `pi --help` | 显示帮助。 |
+| `pi -h` | 等同于 `pi --help`。 |
+| `pi --version` | 显示 Pi 版本。 |
+| `pi -v` | 等同于 `pi --version`。 |
 
 文件参数：
 
-```bash
-pi @prompt.md "Answer this"
-pi -p @screenshot.png "What's in this image?"
-pi @code.ts @test.ts "Review these files"
-```
+| 命令 | 作用 |
+|---|---|
+| `pi @prompt.md "Answer this"` | 将 `prompt.md` 带入初始消息。 |
+| `pi -p @screenshot.png "What's in this image?"` | 在 print 模式下带入图片。 |
+| `pi @code.ts @test.ts "Review these files"` | 将多个文件带入初始消息。 |
 
 ### Pi 内置 Slash 命令
 
-```text
-/login
-/logout
-/model
-/scoped-models
-/settings
-/resume
-/new
-/name <name>
-/session
-/tree
-/fork
-/clone
-/compact [prompt]
-/copy
-/export [file]
-/share
-/reload
-/hotkeys
-/changelog
-/quit
-```
+| 命令 | 作用 |
+|---|---|
+| `/login` | 管理 OAuth 或 API key 登录。 |
+| `/logout` | 退出登录或移除凭据。 |
+| `/model` | 切换模型。 |
+| `/scoped-models` | 启用或禁用 Ctrl+P 循环切换时可用的模型。 |
+| `/settings` | 打开设置，包括 thinking 等级、主题、消息投递和传输方式。 |
+| `/resume` | 从历史会话中选择一个恢复。 |
+| `/new` | 开始新会话。 |
+| `/name <name>` | 设置当前会话显示名称。 |
+| `/session` | 显示会话文件、ID、消息数、token 和费用。 |
+| `/tree` | 跳转到会话树中的任意节点并从那里继续。 |
+| `/fork` | 从之前的用户消息创建新会话。 |
+| `/clone` | 将当前活跃分支复制为新会话。 |
+| `/compact [prompt]` | 手动压缩上下文，可附带自定义压缩指令。 |
+| `/copy` | 将上一条助手消息复制到剪贴板。 |
+| `/export [file]` | 将会话导出为 HTML。 |
+| `/share` | 将会话作为私有 GitHub gist 上传，并生成可分享的 HTML 链接。 |
+| `/reload` | 重新加载快捷键、扩展、skills、提示词和上下文文件。 |
+| `/hotkeys` | 显示所有键盘快捷键。 |
+| `/changelog` | 显示 Pi 版本历史。 |
+| `/quit` | 退出 Pi。 |
 
 ### 可选快捷命令
 
@@ -440,21 +422,11 @@ pi @code.ts @test.ts "Review these files"
 powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 ```
 
-安装后可使用：
-
-```powershell
-pi-models
-pi-codex
-pi-claude
-```
-
-快捷命令展开后等价于：
-
-```powershell
-pi-models  # pi --list-models cc-switch
-pi-codex   # pi --provider cc-switch-codex --model gpt-5.5
-pi-claude  # pi --provider cc-switch-claude --model claude-sonnet-4-5
-```
+| 快捷命令 | 展开后等价于 | 作用 |
+|---|---|---|
+| `pi-models` | `pi --list-models cc-switch` | 快速列出 cc-switch 模型。 |
+| `pi-codex` | `pi --provider cc-switch-codex --model gpt-5.5` | 快速使用 cc-switch Codex provider 启动 Pi。 |
+| `pi-claude` | `pi --provider cc-switch-claude --model claude-sonnet-4-5` | 快速使用 cc-switch Claude provider 启动 Pi。 |
 
 ### Claude 模型
 
@@ -463,10 +435,10 @@ pi-claude  # pi --provider cc-switch-claude --model claude-sonnet-4-5
 默认 Claude 模型 ID 包括：
 
 - `claude-opus-4-7`
+- `claude-opus-4-6`
+- `claude-sonnet-4-6`
 - `claude-opus-4-5`
 - `claude-sonnet-4-5`
-- `claude-sonnet-4`
-- `claude-opus-4`
 
 如需覆盖或追加模型，可在 cc-switch 的 Claude env 配置中设置 `PI_CC_SWITCH_CLAUDE_MODELS`，使用英文逗号或空格分隔多个模型。
 
