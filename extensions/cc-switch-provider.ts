@@ -14,6 +14,7 @@ import {
 	type ImageContent,
 	type Message,
 	type Model,
+	parseStreamingJson,
 	type SimpleStreamOptions,
 	type StopReason,
 	type TextContent,
@@ -35,7 +36,7 @@ interface ClaudeConfig {
 interface CodexConfig {
 	baseUrl: string;
 	apiKey: string;
-	api: "openai-responses" | "openai-completions";
+	api: "cc-switch-codex-responses" | "openai-completions";
 	model: string;
 }
 
@@ -211,7 +212,7 @@ function extractCodexFromConfigText(apiKey: string, configText: string): Extract
 		config: {
 			baseUrl,
 			apiKey,
-			api: wireApi === "chat" ? "openai-completions" : "openai-responses",
+			api: wireApi === "chat" ? "openai-completions" : "cc-switch-codex-responses",
 			model,
 		},
 	};
@@ -792,6 +793,447 @@ function handleAnthropicEvent(
 	}
 }
 
+function endpointForOpenAIResponses(baseUrl: string): string {
+	const trimmed = baseUrl.replace(/\/+$/, "");
+	if (/\/responses$/.test(trimmed)) return trimmed;
+	if (/\/v\d+$/.test(trimmed)) return `${trimmed}/responses`;
+	return `${trimmed}/v1/responses`;
+}
+
+function normalizeResponsesIdPart(value: string): string {
+	const normalized = value.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+	return normalized.replace(/_+$/, "") || `id_${Date.now()}`;
+}
+
+function encodeTextSignature(id: string | undefined, phase: unknown): string | undefined {
+	if (!id) return undefined;
+	const payload: Record<string, unknown> = { v: 1, id };
+	if (phase === "commentary" || phase === "final_answer") payload.phase = phase;
+	return JSON.stringify(payload);
+}
+
+function decodeTextSignature(signature: string | undefined): { id?: string; phase?: string } {
+	if (!signature) return {};
+	try {
+		const parsed = JSON.parse(signature) as unknown;
+		if (isRecord(parsed) && parsed.v === 1 && typeof parsed.id === "string") {
+			return {
+				id: parsed.id,
+				phase: typeof parsed.phase === "string" ? parsed.phase : undefined,
+			};
+		}
+	} catch {
+		// 兼容旧格式：签名直接就是 message id。
+	}
+	return { id: signature };
+}
+
+function convertResponsesMessages(model: Model<Api>, context: Context): Record<string, unknown>[] {
+	const messages: Record<string, unknown>[] = [];
+
+	if (context.systemPrompt) {
+		messages.push({
+			role: model.reasoning ? "developer" : "system",
+			content: sanitizeText(context.systemPrompt),
+		});
+	}
+
+	let messageIndex = 0;
+	for (const message of context.messages) {
+		if (message.role === "user") {
+			const content = typeof message.content === "string"
+				? [{ type: "input_text", text: sanitizeText(message.content) }]
+				: message.content.map((block) => block.type === "text"
+					? { type: "input_text", text: sanitizeText(block.text) }
+					: { type: "input_image", detail: "auto", image_url: `data:${block.mimeType};base64,${block.data}` });
+			if (content.length > 0) messages.push({ role: "user", content });
+			messageIndex += 1;
+			continue;
+		}
+
+		if (message.role === "assistant") {
+			for (const block of message.content) {
+				if (block.type === "thinking" && block.thinkingSignature) {
+					try {
+						const item = JSON.parse(block.thinkingSignature) as unknown;
+						if (isRecord(item)) messages.push(item);
+					} catch {
+						// 无法回放的 reasoning 签名直接跳过，避免污染下一轮请求。
+					}
+				} else if (block.type === "text") {
+					const signature = decodeTextSignature(block.textSignature);
+					messages.push({
+						type: "message",
+						role: "assistant",
+						status: "completed",
+						id: normalizeResponsesIdPart(signature.id ?? `msg_${messageIndex}`),
+						phase: signature.phase,
+						content: [{ type: "output_text", text: sanitizeText(block.text), annotations: [] }],
+					});
+				} else if (block.type === "toolCall") {
+					const [callId, itemId] = block.id.includes("|") ? block.id.split("|") : [block.id, `fc_${block.id}`];
+					messages.push({
+						type: "function_call",
+						id: normalizeResponsesIdPart(itemId),
+						call_id: normalizeResponsesIdPart(callId),
+						name: block.name,
+						arguments: JSON.stringify(block.arguments),
+					});
+				}
+			}
+			messageIndex += 1;
+			continue;
+		}
+
+		if (message.role === "toolResult") {
+			const textResult = message.content
+				.filter((block): block is TextContent => block.type === "text")
+				.map((block) => block.text)
+				.join("\n");
+			const hasImages = message.content.some((block) => block.type === "image");
+			const [callId] = message.toolCallId.split("|");
+			let output: string | Record<string, unknown>[] = sanitizeText(textResult || "(empty tool result)");
+			if (hasImages && model.input.includes("image")) {
+				const parts: Record<string, unknown>[] = [];
+				if (textResult) parts.push({ type: "input_text", text: sanitizeText(textResult) });
+				for (const block of message.content) {
+					if (block.type === "image") {
+						parts.push({ type: "input_image", detail: "auto", image_url: `data:${block.mimeType};base64,${block.data}` });
+					}
+				}
+				output = parts;
+			}
+			messages.push({ type: "function_call_output", call_id: normalizeResponsesIdPart(callId), output });
+			messageIndex += 1;
+		}
+	}
+
+	return messages;
+}
+
+function convertResponsesTools(tools: Tool[] | undefined): Record<string, unknown>[] | undefined {
+	if (!tools || tools.length === 0) return undefined;
+	return tools.map((tool) => ({
+		type: "function",
+		name: tool.name,
+		description: tool.description,
+		parameters: tool.parameters,
+		strict: false,
+	}));
+}
+
+function buildOpenAIResponsesPayload(
+	model: Model<Api>,
+	context: Context,
+	options?: SimpleStreamOptions,
+): Record<string, unknown> {
+	const payload: Record<string, unknown> = {
+		model: model.id,
+		input: convertResponsesMessages(model, context),
+		stream: true,
+		store: false,
+		prompt_cache_key: options?.sessionId,
+	};
+
+	if (options?.maxTokens) payload.max_output_tokens = options.maxTokens;
+	if (options?.temperature !== undefined) payload.temperature = options.temperature;
+
+	const tools = convertResponsesTools(context.tools);
+	if (tools) payload.tools = tools;
+
+	if (model.reasoning) {
+		const reasoning = options?.reasoning;
+		if (reasoning && reasoning !== "off") {
+			payload.reasoning = {
+				effort: model.thinkingLevelMap?.[reasoning] ?? reasoning,
+				summary: "auto",
+			};
+			payload.include = ["reasoning.encrypted_content"];
+		} else if (model.thinkingLevelMap?.off !== null) {
+			payload.reasoning = { effort: model.thinkingLevelMap?.off ?? "none" };
+		}
+	}
+
+	return payload;
+}
+
+function cachedTokenCount(usage: Record<string, unknown>): number {
+	const details = usage.input_tokens_details;
+	if (!isRecord(details)) return 0;
+	return readNumber(details, "cached_tokens") ?? readNumber(details, "cache_read_tokens") ?? 0;
+}
+
+function mapResponsesStopReason(status: string | undefined): StopReason {
+	if (status === "incomplete") return "length";
+	if (status === "failed" || status === "cancelled") return "error";
+	return "stop";
+}
+
+function findOrCreateResponsesTextBlock(
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+): { block: TextContent & { index?: number }; contentIndex: number } {
+	const blocks = output.content as (TextContent & { index?: number })[];
+	const lastIndex = blocks.length - 1;
+	const last = blocks[lastIndex];
+	if (last?.type === "text") return { block: last, contentIndex: lastIndex };
+	const block: TextContent & { index?: number } = { type: "text", text: "" };
+	output.content.push(block);
+	stream.push({ type: "text_start", contentIndex: output.content.length - 1, partial: output });
+	return { block, contentIndex: output.content.length - 1 };
+}
+
+function handleResponsesEvent(
+	event: Record<string, unknown>,
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	model: Model<Api>,
+	state: { currentContentIndex?: number; currentItem?: Record<string, unknown> },
+): void {
+	const type = stringValue(event.type);
+	const blocks = output.content as (StreamBlock | (TextContent & { partialJson?: string; textSignature?: string }))[];
+
+	if (type === "response.created" && isRecord(event.response)) {
+		const responseId = stringValue(event.response.id);
+		if (responseId) output.responseId = responseId;
+		return;
+	}
+
+	if (type === "response.output_item.added" && isRecord(event.item)) {
+		state.currentItem = event.item;
+		const itemType = stringValue(event.item.type);
+		if (itemType === "reasoning") {
+			output.content.push({ type: "thinking", thinking: "" } as ThinkingContent);
+			state.currentContentIndex = output.content.length - 1;
+			stream.push({ type: "thinking_start", contentIndex: state.currentContentIndex, partial: output });
+		} else if (itemType === "message") {
+			output.content.push({ type: "text", text: "" } as TextContent);
+			state.currentContentIndex = output.content.length - 1;
+			stream.push({ type: "text_start", contentIndex: state.currentContentIndex, partial: output });
+		} else if (itemType === "function_call") {
+			const block: ToolCall & { partialJson: string } = {
+				type: "toolCall",
+				id: `${stringValue(event.item.call_id) ?? `call_${Date.now()}`}|${stringValue(event.item.id) ?? `fc_${Date.now()}`}`,
+				name: stringValue(event.item.name) ?? "unknown",
+				arguments: {},
+				partialJson: stringContent(event.item.arguments) ?? "",
+			};
+			output.content.push(block);
+			state.currentContentIndex = output.content.length - 1;
+			stream.push({ type: "toolcall_start", contentIndex: state.currentContentIndex, partial: output });
+		}
+		return;
+	}
+
+	if (type === "response.output_text.delta" || type === "response.refusal.delta") {
+		const delta = stringContent(event.delta) ?? "";
+		const { block, contentIndex } = findOrCreateResponsesTextBlock(output, stream);
+		block.text += delta;
+		stream.push({ type: "text_delta", contentIndex, delta, partial: output });
+		return;
+	}
+
+	if (type === "response.reasoning_text.delta" || type === "response.reasoning_summary_text.delta") {
+		const delta = stringContent(event.delta) ?? "";
+		const contentIndex = state.currentContentIndex ?? output.content.length - 1;
+		const block = blocks[contentIndex];
+		if (block?.type !== "thinking") return;
+		block.thinking += delta;
+		stream.push({ type: "thinking_delta", contentIndex, delta, partial: output });
+		return;
+	}
+
+	if (type === "response.reasoning_summary_part.done") {
+		const contentIndex = state.currentContentIndex ?? output.content.length - 1;
+		const block = blocks[contentIndex];
+		if (block?.type !== "thinking") return;
+		block.thinking += "\n\n";
+		stream.push({ type: "thinking_delta", contentIndex, delta: "\n\n", partial: output });
+		return;
+	}
+
+	if (type === "response.function_call_arguments.delta") {
+		const contentIndex = state.currentContentIndex ?? output.content.length - 1;
+		const block = blocks[contentIndex];
+		if (block?.type !== "toolCall") return;
+		const delta = stringContent(event.delta) ?? "";
+		block.partialJson = `${block.partialJson ?? ""}${delta}`;
+		block.arguments = parseStreamingJson(block.partialJson) as Record<string, unknown>;
+		stream.push({ type: "toolcall_delta", contentIndex, delta, partial: output });
+		return;
+	}
+
+	if (type === "response.function_call_arguments.done") {
+		const contentIndex = state.currentContentIndex ?? output.content.length - 1;
+		const block = blocks[contentIndex];
+		if (block?.type !== "toolCall") return;
+		block.partialJson = stringContent(event.arguments) ?? block.partialJson ?? "{}";
+		block.arguments = parseStreamingJson(block.partialJson) as Record<string, unknown>;
+		return;
+	}
+
+	if (type === "response.output_item.done" && isRecord(event.item)) {
+		const itemType = stringValue(event.item.type);
+		const contentIndex = state.currentContentIndex ?? output.content.length - 1;
+		const block = blocks[contentIndex];
+		if (!block) return;
+
+		if (itemType === "reasoning" && block.type === "thinking") {
+			block.thinkingSignature = JSON.stringify(event.item);
+			stream.push({ type: "thinking_end", contentIndex, content: block.thinking, partial: output });
+		} else if (itemType === "message" && block.type === "text") {
+			if (Array.isArray(event.item.content)) {
+				block.text = event.item.content
+					.map((part) => isRecord(part) ? stringContent(part.text) ?? stringContent(part.refusal) ?? "" : "")
+					.join("") || block.text;
+			}
+			block.textSignature = encodeTextSignature(stringValue(event.item.id), event.item.phase);
+			stream.push({ type: "text_end", contentIndex, content: block.text, partial: output });
+		} else if (itemType === "function_call" && block.type === "toolCall") {
+			delete block.partialJson;
+			stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial: output });
+		}
+		state.currentContentIndex = undefined;
+		state.currentItem = undefined;
+		return;
+	}
+
+	if (type === "response.completed" && isRecord(event.response)) {
+		const responseId = stringValue(event.response.id);
+		if (responseId) output.responseId = responseId;
+		if (isRecord(event.response.usage)) {
+			const cached = cachedTokenCount(event.response.usage);
+			const inputTokens = readNumber(event.response.usage, "input_tokens") ?? 0;
+			const outputTokens = readNumber(event.response.usage, "output_tokens") ?? 0;
+			output.usage = {
+				input: Math.max(0, inputTokens - cached),
+				output: outputTokens,
+				cacheRead: cached,
+				cacheWrite: 0,
+				totalTokens: readNumber(event.response.usage, "total_tokens") ?? inputTokens + outputTokens,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			};
+			calculateCost(model, output.usage);
+		}
+		output.stopReason = mapResponsesStopReason(stringValue(event.response.status));
+		if (output.content.some((block) => block.type === "toolCall") && output.stopReason === "stop") {
+			output.stopReason = "toolUse";
+		}
+		return;
+	}
+
+	if (type === "response.failed" && isRecord(event.response)) {
+		const error = isRecord(event.response.error) ? event.response.error : undefined;
+		throw new Error(error ? `${stringValue(error.code) ?? "unknown"}: ${stringValue(error.message) ?? "no message"}` : "response.failed");
+	}
+
+	if (type === "error") {
+		throw new Error(`${stringValue(event.code) ?? "error"}: ${stringValue(event.message) ?? "unknown error"}`);
+	}
+}
+
+async function processOpenAIResponsesSse(
+	response: Response,
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	model: Model<Api>,
+): Promise<void> {
+	if (!response.body) throw new Error("cc-switch Codex response did not include a stream body");
+	const reader = response.body.getReader();
+	const decoder = new TextDecoder();
+	const state: { currentContentIndex?: number; currentItem?: Record<string, unknown> } = {};
+	let buffer = "";
+
+	while (true) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		buffer += decoder.decode(value, { stream: true });
+		const parsed = parseSseChunk(buffer);
+		buffer = parsed.rest;
+		for (const sse of parsed.events) {
+			if (sse.data === "[DONE]") continue;
+			const event = JSON.parse(sse.data) as unknown;
+			if (isRecord(event)) handleResponsesEvent(event, output, stream, model, state);
+		}
+	}
+
+	const finalParsed = parseSseChunk(buffer + decoder.decode());
+	for (const sse of finalParsed.events) {
+		if (sse.data === "[DONE]") continue;
+		const event = JSON.parse(sse.data) as unknown;
+		if (isRecord(event)) handleResponsesEvent(event, output, stream, model, state);
+	}
+}
+
+function streamCcSwitchCodexResponses(
+	model: Model<Api>,
+	context: Context,
+	options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+	const stream = createAssistantMessageEventStream();
+
+	(async () => {
+		const output: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+
+		try {
+			const apiKey = options?.apiKey;
+			if (!apiKey) throw new Error("Missing cc-switch Codex credential");
+
+			const payload = buildOpenAIResponsesPayload(model, context, options);
+			const headers: Record<string, string> = {
+				accept: "text/event-stream",
+				"content-type": "application/json",
+				authorization: `Bearer ${apiKey}`,
+			};
+			writeDebugRequest(headers, payload);
+
+			const response = await fetch(endpointForOpenAIResponses(model.baseUrl), {
+				method: "POST",
+				headers,
+				body: JSON.stringify(payload),
+				signal: options?.signal,
+			});
+
+			if (!response.ok) {
+				throw new Error(`cc-switch Codex request failed: ${response.status} ${await response.text()}`);
+			}
+
+			stream.push({ type: "start", partial: output });
+			await processOpenAIResponsesSse(response, output, stream, model);
+			if (options?.signal?.aborted) throw new Error("Request was aborted");
+			stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
+			stream.end();
+		} catch (error) {
+			for (const block of output.content) {
+				delete (block as { index?: number }).index;
+				delete (block as { partialJson?: string }).partialJson;
+			}
+			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			output.errorMessage = error instanceof Error ? error.message : String(error);
+			stream.push({ type: "error", reason: output.stopReason, error: output });
+			stream.end();
+		}
+	})();
+
+	return stream;
+}
+
 function streamCcSwitchAnthropic(
 	authKind: AuthKind,
 	model: Model<Api>,
@@ -940,19 +1382,21 @@ export default function (pi: ExtensionAPI) {
 			name: "cc-switch Codex",
 			baseUrl: codex.baseUrl,
 			apiKey: codex.apiKey,
-			api: codex.api,
+			api: codex.api as Api,
 			models: [
 				{
 					id: codex.model,
 					name: `cc-switch Codex (${codex.model})`,
 					reasoning: true,
-					input: codex.api === "openai-responses" ? TEXT_IMAGE_INPUT : TEXT_INPUT,
+					input: codex.api === "cc-switch-codex-responses" ? TEXT_IMAGE_INPUT : TEXT_INPUT,
 					cost: ZERO_COST,
 					contextWindow: 1000000,
 					maxTokens: 64000,
-					compat: codex.api === "openai-responses" ? { sendSessionIdHeader: true } : undefined,
 				},
 			],
+			...(codex.api === "cc-switch-codex-responses"
+				? { streamSimple: (model, context, options) => streamCcSwitchCodexResponses(model, context, options) }
+				: {}),
 		});
 	}
 
