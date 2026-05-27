@@ -828,6 +828,21 @@ function decodeTextSignature(signature: string | undefined): { id?: string; phas
 	return { id: signature };
 }
 
+function isTokenworkResponsesProxy(baseUrl: string): boolean {
+	try {
+		return new URL(baseUrl).hostname.toLowerCase() === "tokenwork.app";
+	} catch {
+		return baseUrl.toLowerCase().includes("tokenwork.app");
+	}
+}
+
+function shouldReplayResponsesReasoning(model: Model<Api>): boolean {
+	// tokenwork.app 在 store=false 时不会持久化 rs_* reasoning item；
+	// 多轮回放这些 item 会 404："Item with id 'rs_...' not found"。
+	// Codex CLI 的 WS 长连接可用连接态续上下文，而这里走无状态 SSE，故对该中转剔除历史 reasoning item。
+	return !isTokenworkResponsesProxy(model.baseUrl);
+}
+
 function convertResponsesMessages(model: Model<Api>, context: Context): Record<string, unknown>[] {
 	const messages: Record<string, unknown>[] = [];
 
@@ -854,11 +869,13 @@ function convertResponsesMessages(model: Model<Api>, context: Context): Record<s
 		if (message.role === "assistant") {
 			for (const block of message.content) {
 				if (block.type === "thinking" && block.thinkingSignature) {
-					try {
-						const item = JSON.parse(block.thinkingSignature) as unknown;
-						if (isRecord(item)) messages.push(item);
-					} catch {
-						// 无法回放的 reasoning 签名直接跳过，避免污染下一轮请求。
+					if (shouldReplayResponsesReasoning(model)) {
+						try {
+							const item = JSON.parse(block.thinkingSignature) as unknown;
+							if (isRecord(item)) messages.push(item);
+						} catch {
+							// 无法回放的 reasoning 签名直接跳过，避免污染下一轮请求。
+						}
 					}
 				} else if (block.type === "text") {
 					const signature = decodeTextSignature(block.textSignature);
