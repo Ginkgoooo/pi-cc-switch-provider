@@ -1155,8 +1155,10 @@ function handleResponsesEvent(
 	}
 
 	if (type === "error") {
-		const errorCode = stringValue(event.code) ?? "error";
-		const errorMsg = stringValue(event.message) ?? "unknown error";
+		// 兼容嵌套的 error 对象（如 {error: {code: "context_length_exceeded", message: "..."}}）
+		const nestedError = isRecord(event.error) ? event.error : undefined;
+		const errorCode = stringValue(nestedError?.code) ?? stringValue(event.code) ?? "error";
+		const errorMsg = stringValue(nestedError?.message) ?? stringValue(event.message) ?? "unknown error";
 		// 记录详细的错误日志，方便调试
 		console.error('[cc-switch Codex Error]', JSON.stringify({
 			type: 'sse_error',
@@ -1165,6 +1167,10 @@ function handleResponsesEvent(
 			rawEvent: event,
 			timestamp: new Date().toISOString()
 		}, null, 2));
+		// 上下文溢出错误需要以 context_length_exceeded 开头，让 pi 自动 compact 重试
+		if (errorCode === "context_length_exceeded" || CLAUDE_OVERFLOW_PATTERNS.some((p) => p.test(errorMsg))) {
+			throw new Error(`context_length_exceeded: ${errorMsg}`);
+		}
 		throw new Error(`cc-switch Codex error: ${errorCode}: ${errorMsg}`);
 	}
 }
@@ -1381,6 +1387,10 @@ function streamCcSwitchAnthropic(
 							data: sse.data,
 							timestamp: new Date().toISOString()
 						}, null, 2));
+						// 上下文溢出错误需要以 context_length_exceeded 开头，让 pi 自动 compact 重试
+						if (CLAUDE_OVERFLOW_PATTERNS.some((p) => p.test(sse.data))) {
+							throw new Error(`context_length_exceeded: ${sse.data}`);
+						}
 						throw new Error(`cc-switch Claude error: ${sse.data}`);
 					}
 					const event = JSON.parse(sse.data) as unknown;
