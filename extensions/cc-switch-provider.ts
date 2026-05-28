@@ -1143,32 +1143,28 @@ function handleResponsesEvent(
 		const error = isRecord(event.response.error) ? event.response.error : undefined;
 		const errorCode = error ? stringValue(error.code) ?? "unknown" : "response.failed";
 		const errorMsg = error ? stringValue(error.message) ?? "no message" : "response.failed";
-		// 记录详细的错误信息，方便调试
-		if (process.env.PI_CC_SWITCH_DEBUG === "1") {
-			console.error('[cc-switch Codex Error]', JSON.stringify({
-				type: 'response.failed',
-				code: errorCode,
-				message: errorMsg,
-				rawEvent: event,
-				timestamp: new Date().toISOString()
-			}, null, 2));
-		}
+		// 记录详细的错误日志，方便调试
+		console.error('[cc-switch Codex Error]', JSON.stringify({
+			type: 'response.failed',
+			code: errorCode,
+			message: errorMsg,
+			rawEvent: event,
+			timestamp: new Date().toISOString()
+		}, null, 2));
 		throw new Error(`cc-switch Codex error: ${errorCode}: ${errorMsg}`);
 	}
 
 	if (type === "error") {
 		const errorCode = stringValue(event.code) ?? "error";
 		const errorMsg = stringValue(event.message) ?? "unknown error";
-		// 记录详细的错误信息，方便调试
-		if (process.env.PI_CC_SWITCH_DEBUG === "1") {
-			console.error('[cc-switch Codex Error]', JSON.stringify({
-				type: 'sse_error',
-				code: errorCode,
-				message: errorMsg,
-				rawEvent: event,
-				timestamp: new Date().toISOString()
-			}, null, 2));
-		}
+		// 记录详细的错误日志，方便调试
+		console.error('[cc-switch Codex Error]', JSON.stringify({
+			type: 'sse_error',
+			code: errorCode,
+			message: errorMsg,
+			rawEvent: event,
+			timestamp: new Date().toISOString()
+		}, null, 2));
 		throw new Error(`cc-switch Codex error: ${errorCode}: ${errorMsg}`);
 	}
 }
@@ -1378,15 +1374,13 @@ function streamCcSwitchAnthropic(
 				buffer = parsed.rest;
 				for (const sse of parsed.events) {
 					if (sse.event === "error") {
-						// 记录详细的错误信息，方便调试
-						if (process.env.PI_CC_SWITCH_DEBUG === "1") {
-							console.error('[cc-switch Claude Error]', JSON.stringify({
-								type: 'sse_error',
-								event: sse.event,
-								data: sse.data,
-								timestamp: new Date().toISOString()
-							}, null, 2));
-						}
+						// 记录详细的错误日志，方便调试
+						console.error('[cc-switch Claude Error]', JSON.stringify({
+							type: 'sse_error',
+							event: sse.event,
+							data: sse.data,
+							timestamp: new Date().toISOString()
+						}, null, 2));
 						throw new Error(`cc-switch Claude error: ${sse.data}`);
 					}
 					const event = JSON.parse(sse.data) as unknown;
