@@ -438,6 +438,9 @@ function convertUserContent(content: string | (TextContent | ImageContent)[]): R
 function convertMessages(messages: Message[]): Record<string, unknown>[] {
 	const converted: Record<string, unknown>[] = [];
 
+	// 跟踪已有的 tool_use，用于检测缺失的 tool_result
+	const pendingToolUseIds = new Set<string>();
+
 	for (let index = 0; index < messages.length; index += 1) {
 		const message = messages[index];
 		if (message.role === "user") {
@@ -469,6 +472,8 @@ function convertMessages(messages: Message[]): Record<string, unknown>[] {
 						name: block.name,
 						input: block.arguments,
 					});
+					// 跟踪未完成的 tool_use
+					pendingToolUseIds.add(block.id);
 				}
 			}
 			if (content.length > 0) {
@@ -480,15 +485,34 @@ function convertMessages(messages: Message[]): Record<string, unknown>[] {
 		if (message.role === "toolResult") {
 			const toolResults: Record<string, unknown>[] = [];
 			toolResults.push(convertToolResult(message));
+			// 标记此 toolCallId 已有对应的 tool_result
+			pendingToolUseIds.delete(message.toolCallId);
 
 			let nextIndex = index + 1;
 			while (nextIndex < messages.length && messages[nextIndex].role === "toolResult") {
-				toolResults.push(convertToolResult(messages[nextIndex] as ToolResultMessage));
+				const nextMsg = messages[nextIndex] as ToolResultMessage;
+				toolResults.push(convertToolResult(nextMsg));
+				// 标记此 toolCallId 已有对应的 tool_result
+				pendingToolUseIds.delete(nextMsg.toolCallId);
 				nextIndex += 1;
 			}
 			index = nextIndex - 1;
 			converted.push({ role: "user", content: toolResults });
 		}
+	}
+
+	// 为未完成的 tool_use 补充错误的 tool_result，避免 API 报错
+	for (const toolUseId of pendingToolUseIds) {
+		console.warn(`[cc-switch] 补充缺失的 tool_result: ${toolUseId}`);
+		converted.push({
+			role: "user",
+			content: [{
+				type: "tool_result",
+				tool_use_id: toolUseId,
+				content: "[Error] Tool execution was interrupted",
+				is_error: true
+			}]
+		});
 	}
 
 	return converted;
@@ -853,6 +877,9 @@ function convertResponsesMessages(model: Model<Api>, context: Context): Record<s
 		});
 	}
 
+	// 跟踪已有的 function_call，用于检测缺失的 function_call_output
+	const pendingCallIds = new Set<string>();
+
 	let messageIndex = 0;
 	for (const message of context.messages) {
 		if (message.role === "user") {
@@ -889,13 +916,16 @@ function convertResponsesMessages(model: Model<Api>, context: Context): Record<s
 					});
 				} else if (block.type === "toolCall") {
 					const [callId, itemId] = block.id.includes("|") ? block.id.split("|") : [block.id, `fc_${block.id}`];
+					const normalizedCallId = normalizeResponsesIdPart(callId);
 					messages.push({
 						type: "function_call",
 						id: normalizeResponsesIdPart(itemId),
-						call_id: normalizeResponsesIdPart(callId),
+						call_id: normalizedCallId,
 						name: block.name,
 						arguments: JSON.stringify(block.arguments),
 					});
+					// 跟踪未完成的 function_call
+					pendingCallIds.add(normalizedCallId);
 				}
 			}
 			messageIndex += 1;
@@ -920,9 +950,22 @@ function convertResponsesMessages(model: Model<Api>, context: Context): Record<s
 				}
 				output = parts;
 			}
-			messages.push({ type: "function_call_output", call_id: normalizeResponsesIdPart(callId), output });
+			const normalizedCallId = normalizeResponsesIdPart(callId);
+			messages.push({ type: "function_call_output", call_id: normalizedCallId, output });
+			// 标记此 call_id 已有对应的 output
+			pendingCallIds.delete(normalizedCallId);
 			messageIndex += 1;
 		}
+	}
+
+	// 为未完成的 function_call 补充错误的 function_call_output，避免 API 报错
+	for (const callId of pendingCallIds) {
+		console.warn(`[cc-switch] 补充缺失的 function_call_output: ${callId}`);
+		messages.push({
+			type: "function_call_output",
+			call_id: callId,
+			output: "[Error] Tool execution was interrupted",
+		});
 	}
 
 	return messages;
