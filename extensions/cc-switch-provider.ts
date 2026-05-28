@@ -1141,11 +1141,35 @@ function handleResponsesEvent(
 
 	if (type === "response.failed" && isRecord(event.response)) {
 		const error = isRecord(event.response.error) ? event.response.error : undefined;
-		throw new Error(error ? `${stringValue(error.code) ?? "unknown"}: ${stringValue(error.message) ?? "no message"}` : "response.failed");
+		const errorCode = error ? stringValue(error.code) ?? "unknown" : "response.failed";
+		const errorMsg = error ? stringValue(error.message) ?? "no message" : "response.failed";
+		// 记录详细的错误信息，方便调试
+		if (process.env.PI_CC_SWITCH_DEBUG === "1") {
+			console.error('[cc-switch Codex Error]', JSON.stringify({
+				type: 'response.failed',
+				code: errorCode,
+				message: errorMsg,
+				rawEvent: event,
+				timestamp: new Date().toISOString()
+			}, null, 2));
+		}
+		throw new Error(`cc-switch Codex error: ${errorCode}: ${errorMsg}`);
 	}
 
 	if (type === "error") {
-		throw new Error(`${stringValue(event.code) ?? "error"}: ${stringValue(event.message) ?? "unknown error"}`);
+		const errorCode = stringValue(event.code) ?? "error";
+		const errorMsg = stringValue(event.message) ?? "unknown error";
+		// 记录详细的错误信息，方便调试
+		if (process.env.PI_CC_SWITCH_DEBUG === "1") {
+			console.error('[cc-switch Codex Error]', JSON.stringify({
+				type: 'sse_error',
+				code: errorCode,
+				message: errorMsg,
+				rawEvent: event,
+				timestamp: new Date().toISOString()
+			}, null, 2));
+		}
+		throw new Error(`cc-switch Codex error: ${errorCode}: ${errorMsg}`);
 	}
 }
 
@@ -1237,6 +1261,20 @@ function streamCcSwitchCodexResponses(
 			stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
 			stream.end();
 		} catch (error) {
+			// 记录详细的错误日志，方便调试
+			const errorDetails = {
+				provider: 'cc-switch-codex',
+				model: model.id,
+				api: model.api,
+				error: error instanceof Error ? {
+					message: error.message,
+					stack: error.stack,
+					name: error.name
+				} : error,
+				timestamp: new Date().toISOString()
+			};
+			console.error('[cc-switch Codex Error]', JSON.stringify(errorDetails, null, 2));
+
 			for (const block of output.content) {
 				delete (block as { index?: number }).index;
 				delete (block as { partialJson?: string }).partialJson;
@@ -1339,7 +1377,18 @@ function streamCcSwitchAnthropic(
 				const parsed = parseSseChunk(buffer);
 				buffer = parsed.rest;
 				for (const sse of parsed.events) {
-					if (sse.event === "error") throw new Error(sse.data);
+					if (sse.event === "error") {
+						// 记录详细的错误信息，方便调试
+						if (process.env.PI_CC_SWITCH_DEBUG === "1") {
+							console.error('[cc-switch Claude Error]', JSON.stringify({
+								type: 'sse_error',
+								event: sse.event,
+								data: sse.data,
+								timestamp: new Date().toISOString()
+							}, null, 2));
+						}
+						throw new Error(`cc-switch Claude error: ${sse.data}`);
+					}
 					const event = JSON.parse(sse.data) as unknown;
 					if (isRecord(event)) handleAnthropicEvent(event, output, stream, model);
 				}
@@ -1355,6 +1404,20 @@ function streamCcSwitchAnthropic(
 			stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
 			stream.end();
 		} catch (error) {
+			// 记录详细的错误日志，方便调试
+			const errorDetails = {
+				provider: 'cc-switch-claude',
+				model: model.id,
+				api: model.api,
+				error: error instanceof Error ? {
+					message: error.message,
+					stack: error.stack,
+					name: error.name
+				} : error,
+				timestamp: new Date().toISOString()
+			};
+			console.error('[cc-switch Claude Error]', JSON.stringify(errorDetails, null, 2));
+
 			for (const block of output.content) {
 				delete (block as { index?: number }).index;
 				delete (block as { partialJson?: string }).partialJson;
