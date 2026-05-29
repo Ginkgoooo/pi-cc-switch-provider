@@ -31,6 +31,7 @@ interface ClaudeConfig {
 	apiKey: string;
 	authKind: AuthKind;
 	models: string[];
+	currentModel?: string;
 }
 
 interface CodexConfig {
@@ -57,24 +58,7 @@ type StreamBlock =
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const TEXT_INPUT = ["text"] as ("text" | "image")[];
 const TEXT_IMAGE_INPUT = ["text", "image"] as ("text" | "image")[];
-// pi-ai 官方模型表确认：4-6+ 才是 1M 上下文，4-5 及之前仍是 200K。
-// 不要写 "claude-sonnet-4" 这种无后缀别名——Anthropic 真实 alias 是 -0 结尾，直接写裸名会被网关 404。
-const DEFAULT_CLAUDE_MODELS = [
-	"claude-opus-4-8",
-	"claude-opus-4-7",
-	"claude-opus-4-6",
-	"claude-sonnet-4-6",
-	"claude-opus-4-5",
-	"claude-sonnet-4-5",
-];
-// 1M 上下文模型白名单：仅列 pi-ai models.generated.js 中 contextWindow=1000000 的条目，
-// 允许带版本/日期后缀（如 "claude-opus-4-6-v1" / "claude-opus-4-7-20251201"）。
-const ONE_MILLION_CONTEXT_MODEL_PREFIXES = [
-	"claude-sonnet-4-6",
-	"claude-opus-4-6",
-	"claude-opus-4-7",
-	"claude-opus-4-8",
-];
+const CURRENT_CLAUDE_MODEL_ID = "current";
 const CONTEXT_1M_BETA = "context-1m-2025-08-07";
 const CLAUDE_CODE_BETAS = [
 	"claude-code-20250219",
@@ -158,6 +142,15 @@ function uniqueStrings(values: string[]): string[] {
 
 type ExtractResult<T> = { ok: true; config: T } | { ok: false; error: string };
 
+function currentClaudeModelFromEnv(env: Record<string, unknown>): string | undefined {
+	return (
+		stringValue(env.ANTHROPIC_MODEL) ??
+		stringValue(env.ANTHROPIC_DEFAULT_SONNET_MODEL) ??
+		stringValue(env.ANTHROPIC_DEFAULT_OPUS_MODEL) ??
+		stringValue(env.ANTHROPIC_DEFAULT_HAIKU_MODEL)
+	);
+}
+
 function extractClaudeFromEnv(env: Record<string, unknown>): ExtractResult<ClaudeConfig> {
 	const baseUrl = stringValue(env.ANTHROPIC_BASE_URL);
 	const authToken = stringValue(env.ANTHROPIC_AUTH_TOKEN);
@@ -167,19 +160,18 @@ function extractClaudeFromEnv(env: Record<string, unknown>): ExtractResult<Claud
 		return { ok: false, error: "neither env.ANTHROPIC_AUTH_TOKEN nor env.ANTHROPIC_API_KEY is set" };
 	}
 
+	const currentModel = currentClaudeModelFromEnv(env);
 	return {
 		ok: true,
 		config: {
 			baseUrl,
 			apiKey: (authToken ?? apiKey) as string,
 			authKind: authToken ? "bearer" : "api-key",
+			currentModel,
 			models: uniqueStrings([
+				CURRENT_CLAUDE_MODEL_ID,
+				...(currentModel ? [currentModel] : []),
 				...splitModelList(env.PI_CC_SWITCH_CLAUDE_MODELS),
-				stringValue(env.ANTHROPIC_MODEL) ??
-					stringValue(env.ANTHROPIC_DEFAULT_SONNET_MODEL) ??
-					stringValue(env.ANTHROPIC_DEFAULT_OPUS_MODEL) ??
-					"claude-sonnet-4-5",
-				...DEFAULT_CLAUDE_MODELS,
 			]),
 		},
 	};
@@ -375,9 +367,11 @@ function endpointForAnthropicMessages(baseUrl: string): string {
  * 允许带版本/日期后缀（如 "claude-opus-4-7-20251201" / "claude-opus-4-6-v1"）。
  */
 function supportsOneMillionContext(modelId: string): boolean {
-	return ONE_MILLION_CONTEXT_MODEL_PREFIXES.some(
-		(prefix) => modelId === prefix || modelId.startsWith(`${prefix}-`),
-	);
+	const normalized = modelId.toLowerCase().replace(/\./g, "-");
+	const opusMatch = normalized.match(/(?:^|[^a-z])claude-opus-4-(\d+)(?:\D|$)/);
+	if (opusMatch && Number(opusMatch[1]) >= 6) return true;
+	const sonnetMatch = normalized.match(/(?:^|[^a-z])claude-sonnet-4-(\d+)(?:\D|$)/);
+	return Boolean(sonnetMatch && Number(sonnetMatch[1]) >= 6);
 }
 
 function anthropicBetaHeader(modelId: string): string | undefined {
@@ -386,6 +380,28 @@ function anthropicBetaHeader(modelId: string): string | undefined {
 
 function claudeContextWindow(modelId: string): number {
 	return supportsOneMillionContext(modelId) ? 1000000 : 200000;
+}
+
+function isCurrentClaudeModel(modelId: string): boolean {
+	return modelId === CURRENT_CLAUDE_MODEL_ID;
+}
+
+function resolveRuntimeClaudeModel(model: Model<Api>, liveConfig?: ClaudeConfig): Model<Api> {
+	if (!isCurrentClaudeModel(model.id)) {
+		return model;
+	}
+	if (!liveConfig?.currentModel) {
+		throw new Error("cc-switch Claude current model is not set in ~/.claude/settings.json");
+	}
+	const currentModel = liveConfig.currentModel;
+	return {
+		...model,
+		id: currentModel,
+		name: `cc-switch Claude (${currentModel})`,
+		baseUrl: liveConfig.baseUrl,
+		contextWindow: claudeContextWindow(currentModel),
+		thinkingLevelMap: supportsOneMillionContext(currentModel) ? { xhigh: "xhigh" } : undefined,
+	};
 }
 
 function resolveClaudeRequestModel(modelId: string): string {
@@ -1364,7 +1380,10 @@ function streamCcSwitchAnthropic(
 		};
 
 		try {
-			const apiKey = options?.apiKey;
+			const liveClaude = loadClaudeConfig();
+			const runtimeModel = resolveRuntimeClaudeModel(model, liveClaude);
+			output.model = runtimeModel.id;
+			const apiKey = liveClaude?.apiKey ?? options?.apiKey;
 			if (!apiKey) throw new Error("Missing cc-switch Claude credential");
 
 			const sessionId = randomUUID();
@@ -1385,20 +1404,21 @@ function streamCcSwitchAnthropic(
 				"x-stainless-runtime-version": "v24.3.0",
 				"x-stainless-timeout": "600",
 			};
-			const requestModel = resolveClaudeRequestModel(model.id);
+			const requestModel = resolveClaudeRequestModel(runtimeModel.id);
 			const betaHeader = anthropicBetaHeader(requestModel);
 			if (betaHeader) {
 				headers["anthropic-beta"] = betaHeader;
 			}
-			if (authKind === "bearer") {
+			const runtimeAuthKind = liveClaude?.authKind ?? authKind;
+			if (runtimeAuthKind === "bearer") {
 				headers.Authorization = `Bearer ${apiKey}`;
 			} else {
 				headers["x-api-key"] = apiKey;
 			}
 
-			const payload = buildAnthropicPayload(model, context, sessionId, options);
+			const payload = buildAnthropicPayload(runtimeModel, context, sessionId, options);
 			writeDebugRequest(headers, payload);
-			const response = await fetch(endpointForAnthropicMessages(model.baseUrl), {
+			const response = await fetch(endpointForAnthropicMessages(runtimeModel.baseUrl), {
 				method: "POST",
 				headers,
 				body: JSON.stringify(payload),
@@ -1439,14 +1459,14 @@ function streamCcSwitchAnthropic(
 						throw new Error(`cc-switch Claude error: ${sse.data}`);
 					}
 					const event = JSON.parse(sse.data) as unknown;
-					if (isRecord(event)) handleAnthropicEvent(event, output, stream, model);
+					if (isRecord(event)) handleAnthropicEvent(event, output, stream, runtimeModel);
 				}
 			}
 
 			const finalParsed = parseSseChunk(buffer + decoder.decode());
 			for (const sse of finalParsed.events) {
 				const event = JSON.parse(sse.data) as unknown;
-				if (isRecord(event)) handleAnthropicEvent(event, output, stream, model);
+				if (isRecord(event)) handleAnthropicEvent(event, output, stream, runtimeModel);
 			}
 
 			if (options?.signal?.aborted) throw new Error("Request was aborted");
@@ -1456,7 +1476,7 @@ function streamCcSwitchAnthropic(
 			// 记录详细的错误日志，方便调试
 			const errorDetails = {
 				provider: 'cc-switch-claude',
-				model: model.id,
+				model: output.model,
 				api: model.api,
 				error: error instanceof Error ? {
 					message: error.message,
@@ -1489,17 +1509,22 @@ export default function (pi: ExtensionAPI) {
 			baseUrl: claude.baseUrl,
 			apiKey: claude.apiKey,
 			api: "cc-switch-anthropic" as Api,
-			models: claude.models.map((model) => ({
-				id: model,
-				name: `cc-switch Claude (${model})`,
-				reasoning: true,
-				// 仅 1M 上下文模型暴露 xhigh 档；其他模型让 pi UI 自动隐藏 xhigh。
-				thinkingLevelMap: supportsOneMillionContext(model) ? { xhigh: "xhigh" } : undefined,
-				input: TEXT_IMAGE_INPUT,
-				cost: ZERO_COST,
-				contextWindow: claudeContextWindow(model),
-				maxTokens: 64000,
-			})),
+			models: claude.models.map((model) => {
+				const displayModel = isCurrentClaudeModel(model) ? (claude.currentModel ?? "unknown") : model;
+				return {
+					id: model,
+					name: isCurrentClaudeModel(model)
+						? `cc-switch Claude (current: ${displayModel})`
+						: `cc-switch Claude (${model})`,
+					reasoning: true,
+					// 仅 1M 上下文模型暴露 xhigh 档；其他模型让 pi UI 自动隐藏 xhigh。
+					thinkingLevelMap: supportsOneMillionContext(displayModel) ? { xhigh: "xhigh" } : undefined,
+					input: TEXT_IMAGE_INPUT,
+					cost: ZERO_COST,
+					contextWindow: claudeContextWindow(displayModel),
+					maxTokens: 64000,
+				};
+			}),
 			streamSimple: (model, context, options) =>
 				streamCcSwitchAnthropic(claude.authKind, model, context, options),
 		});
@@ -1532,9 +1557,10 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("cc-switch", {
 		description: "Show cc-switch provider import status",
 		handler: (_args, ctx) => {
+			const liveClaude = loadClaudeConfig() ?? claude;
 			const lines = [
-				claude
-					? `Claude: ${claude.models.map((model) => `cc-switch-claude/${model}`).join(", ")} -> ${claude.baseUrl}`
+				liveClaude
+					? `Claude: current=${liveClaude.currentModel ?? "unknown"}; models=${liveClaude.models.map((model) => `cc-switch-claude/${model}`).join(", ")} -> ${liveClaude.baseUrl}`
 					: loadDiagnostics.claude ?? "Claude: no ~/.claude/settings.json provider found",
 				codex
 					? `Codex: cc-switch-codex/${codex.model} -> ${codex.baseUrl}`

@@ -37,8 +37,8 @@ pi install git:github.com/Ginkgoooo/pi-cc-switch-provider
 | `pi --list-models cc-switch` | List all models registered by this extension. |
 | `pi` | Start Pi directly. After startup, use `/model` to select a cc-switch model. |
 | `pi --provider cc-switch-codex --model gpt-5.5` | Start Pi with the Codex provider imported from cc-switch. Replace the model with the one shown by `pi --list-models cc-switch` if needed. |
-| `pi --provider cc-switch-claude --model claude-sonnet-4-5` | Start Pi with the Claude provider and the `claude-sonnet-4-5` model imported from cc-switch. |
-| `pi --provider cc-switch-claude --model claude-opus-4-8` | Start Pi with the Claude provider and the `claude-opus-4-8` model imported from cc-switch. |
+| `pi --provider cc-switch-claude --model current` | Start Pi with the Claude provider and follow the current model selected in cc-switch. |
+| `pi --provider cc-switch-claude --model mimo-v2.5-pro` | Start Pi with a concrete Claude model imported from cc-switch. Replace it with the one shown by `pi --list-models cc-switch`. |
 | `/cc-switch` | Show the import status of cc-switch Codex and Claude providers inside Pi. |
 | `/model` | Pi built-in command for selecting or switching models inside Pi. |
 
@@ -48,8 +48,8 @@ Examples:
 pi --list-models cc-switch
 pi
 pi --provider cc-switch-codex --model gpt-5.5
-pi --provider cc-switch-claude --model claude-sonnet-4-5
-pi --provider cc-switch-claude --model claude-opus-4-8
+pi --provider cc-switch-claude --model current
+pi --provider cc-switch-claude --model mimo-v2.5-pro
 ```
 
 Inside Pi:
@@ -206,18 +206,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 
 ### Claude Models
 
-The extension registers several common Claude model IDs because cc-switch providers may route models automatically without writing a single model to `.claude/settings.json`.
+The extension registers `cc-switch-claude/current`, which re-reads `%USERPROFILE%\.claude\settings.json` before each request and follows the current model selected in cc-switch. It also registers the concrete model currently written by cc-switch, such as `mimo-v2.5-pro`.
 
-Default Claude model IDs include:
-
-- `claude-opus-4-8`
-- `claude-opus-4-7`
-- `claude-opus-4-6`
-- `claude-sonnet-4-6`
-- `claude-opus-4-5`
-- `claude-sonnet-4-5`
-
-To override or add models, set `PI_CC_SWITCH_CLAUDE_MODELS` in cc-switch's Claude env config as a comma- or space-separated list.
+To add extra fixed models, set `PI_CC_SWITCH_CLAUDE_MODELS` in cc-switch's Claude env config as a comma- or space-separated list.
 
 ### Security
 
@@ -262,8 +253,8 @@ pi install git:github.com/Ginkgoooo/pi-cc-switch-provider
 | `pi --list-models cc-switch` | 列出本扩展注册的所有 cc-switch 模型。 |
 | `pi` | 直接启动 Pi。启动后可在 Pi 内使用 `/model` 选择 cc-switch 模型。 |
 | `pi --provider cc-switch-codex --model gpt-5.5` | 使用 cc-switch 导入的 Codex provider 启动 Pi。如实际模型不同，可替换为 `pi --list-models cc-switch` 显示的模型。 |
-| `pi --provider cc-switch-claude --model claude-sonnet-4-5` | 使用 cc-switch 导入的 Claude provider 和 `claude-sonnet-4-5` 模型启动 Pi。 |
-| `pi --provider cc-switch-claude --model claude-opus-4-8` | 使用 cc-switch 导入的 Claude provider 和 `claude-opus-4-8` 模型启动 Pi。 |
+| `pi --provider cc-switch-claude --model current` | 使用 cc-switch 导入的 Claude provider，并跟随 cc-switch 当前选择的模型。 |
+| `pi --provider cc-switch-claude --model mimo-v2.5-pro` | 使用 cc-switch 导入的 Claude provider 和具体模型启动 Pi。可替换为 `pi --list-models cc-switch` 显示的模型。 |
 | `/cc-switch` | 在 Pi 内查看 cc-switch Codex 和 Claude provider 的导入状态。 |
 | `/model` | Pi 内置命令，用于在 Pi 内选择或切换模型。 |
 
@@ -273,8 +264,8 @@ pi install git:github.com/Ginkgoooo/pi-cc-switch-provider
 pi --list-models cc-switch
 pi
 pi --provider cc-switch-codex --model gpt-5.5
-pi --provider cc-switch-claude --model claude-sonnet-4-5
-pi --provider cc-switch-claude --model claude-opus-4-8
+pi --provider cc-switch-claude --model current
+pi --provider cc-switch-claude --model mimo-v2.5-pro
 ```
 
 在 Pi 内运行：
@@ -431,18 +422,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 
 ### Claude 模型
 
-该扩展会注册多个常见 Claude 模型 ID，因为 cc-switch provider 可能会自动路由模型，而不一定会把单个模型写入 `.claude/settings.json`。
+该扩展会注册 `cc-switch-claude/current`，并在每次请求前重新读取 `%USERPROFILE%\.claude\settings.json`，跟随 cc-switch 当前选择的模型。它也会注册 cc-switch 当前写入的具体模型，例如 `mimo-v2.5-pro`。
 
-默认 Claude 模型 ID 包括：
-
-- `claude-opus-4-8`
-- `claude-opus-4-7`
-- `claude-opus-4-6`
-- `claude-sonnet-4-6`
-- `claude-opus-4-5`
-- `claude-sonnet-4-5`
-
-如需覆盖或追加模型，可在 cc-switch 的 Claude env 配置中设置 `PI_CC_SWITCH_CLAUDE_MODELS`，使用英文逗号或空格分隔多个模型。
+如需追加固定模型，可在 cc-switch 的 Claude env 配置中设置 `PI_CC_SWITCH_CLAUDE_MODELS`，使用英文逗号或空格分隔多个模型。
 
 ### 安全说明
 
