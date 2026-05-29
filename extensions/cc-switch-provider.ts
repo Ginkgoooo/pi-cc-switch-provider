@@ -56,9 +56,10 @@ type StreamBlock =
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const TEXT_INPUT = ["text"] as ("text" | "image")[];
 const TEXT_IMAGE_INPUT = ["text", "image"] as ("text" | "image")[];
-// pi-ai 官方模型表确认：4-6 / 4-7 才是 1M 上下文，4-5 及之前仍是 200K。
+// pi-ai 官方模型表确认：4-6+ 才是 1M 上下文，4-5 及之前仍是 200K。
 // 不要写 "claude-sonnet-4" 这种无后缀别名——Anthropic 真实 alias 是 -0 结尾，直接写裸名会被网关 404。
 const DEFAULT_CLAUDE_MODELS = [
+	"claude-opus-4-8",
 	"claude-opus-4-7",
 	"claude-opus-4-6",
 	"claude-sonnet-4-6",
@@ -71,6 +72,7 @@ const ONE_MILLION_CONTEXT_MODEL_PREFIXES = [
 	"claude-sonnet-4-6",
 	"claude-opus-4-6",
 	"claude-opus-4-7",
+	"claude-opus-4-8",
 ];
 const CONTEXT_1M_BETA = "context-1m-2025-08-07";
 const CLAUDE_CODE_BETAS = [
@@ -368,7 +370,7 @@ function endpointForAnthropicMessages(baseUrl: string): string {
  * 是否为支持 1M 上下文 + Claude Code beta 的模型。
  *
  * 数据来源：@earendil-works/pi-ai 的 models.generated.js 中 contextWindow=1000000 的 anthropic-messages 条目。
- * 当前只有 4-6 / 4-7 系列；4-5 及更早仍是 200K，不要在 4-5 上开 1M beta 否则会被网关拒掉。
+ * 当前只有 4-6+ 系列；4-5 及更早仍是 200K，不要在 4-5 上开 1M beta 否则会被网关拒掉。
  * 允许带版本/日期后缀（如 "claude-opus-4-7-20251201" / "claude-opus-4-6-v1"）。
  */
 function supportsOneMillionContext(modelId: string): boolean {

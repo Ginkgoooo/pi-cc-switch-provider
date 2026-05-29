@@ -38,7 +38,7 @@ pi install git:github.com/Ginkgoooo/pi-cc-switch-provider
 | `pi` | Start Pi directly. After startup, use `/model` to select a cc-switch model. |
 | `pi --provider cc-switch-codex --model gpt-5.5` | Start Pi with the Codex provider imported from cc-switch. Replace the model with the one shown by `pi --list-models cc-switch` if needed. |
 | `pi --provider cc-switch-claude --model claude-sonnet-4-5` | Start Pi with the Claude provider and the `claude-sonnet-4-5` model imported from cc-switch. |
-| `pi --provider cc-switch-claude --model claude-opus-4-7` | Start Pi with the Claude provider and the `claude-opus-4-7` model imported from cc-switch. |
+| `pi --provider cc-switch-claude --model claude-opus-4-8` | Start Pi with the Claude provider and the `claude-opus-4-8` model imported from cc-switch. |
 | `/cc-switch` | Show the import status of cc-switch Codex and Claude providers inside Pi. |
 | `/model` | Pi built-in command for selecting or switching models inside Pi. |
 
@@ -49,7 +49,7 @@ pi --list-models cc-switch
 pi
 pi --provider cc-switch-codex --model gpt-5.5
 pi --provider cc-switch-claude --model claude-sonnet-4-5
-pi --provider cc-switch-claude --model claude-opus-4-7
+pi --provider cc-switch-claude --model claude-opus-4-8
 ```
 
 Inside Pi:
@@ -210,6 +210,7 @@ The extension registers several common Claude model IDs because cc-switch provid
 
 Default Claude model IDs include:
 
+- `claude-opus-4-8`
 - `claude-opus-4-7`
 - `claude-opus-4-6`
 - `claude-sonnet-4-6`
@@ -262,7 +263,7 @@ pi install git:github.com/Ginkgoooo/pi-cc-switch-provider
 | `pi` | 直接启动 Pi。启动后可在 Pi 内使用 `/model` 选择 cc-switch 模型。 |
 | `pi --provider cc-switch-codex --model gpt-5.5` | 使用 cc-switch 导入的 Codex provider 启动 Pi。如实际模型不同，可替换为 `pi --list-models cc-switch` 显示的模型。 |
 | `pi --provider cc-switch-claude --model claude-sonnet-4-5` | 使用 cc-switch 导入的 Claude provider 和 `claude-sonnet-4-5` 模型启动 Pi。 |
-| `pi --provider cc-switch-claude --model claude-opus-4-7` | 使用 cc-switch 导入的 Claude provider 和 `claude-opus-4-7` 模型启动 Pi。 |
+| `pi --provider cc-switch-claude --model claude-opus-4-8` | 使用 cc-switch 导入的 Claude provider 和 `claude-opus-4-8` 模型启动 Pi。 |
 | `/cc-switch` | 在 Pi 内查看 cc-switch Codex 和 Claude provider 的导入状态。 |
 | `/model` | Pi 内置命令，用于在 Pi 内选择或切换模型。 |
 
@@ -273,7 +274,7 @@ pi --list-models cc-switch
 pi
 pi --provider cc-switch-codex --model gpt-5.5
 pi --provider cc-switch-claude --model claude-sonnet-4-5
-pi --provider cc-switch-claude --model claude-opus-4-7
+pi --provider cc-switch-claude --model claude-opus-4-8
 ```
 
 在 Pi 内运行：
@@ -434,6 +435,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 
 默认 Claude 模型 ID 包括：
 
+- `claude-opus-4-8`
 - `claude-opus-4-7`
 - `claude-opus-4-6`
 - `claude-sonnet-4-6`
