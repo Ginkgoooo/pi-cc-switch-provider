@@ -39,6 +39,7 @@ pi install git:github.com/Ginkgoooo/pi-cc-switch-provider
 | `pi --provider cc-switch-codex --model gpt-5.5` | Start Pi with the Codex provider imported from cc-switch. Replace the model with the one shown by `pi --list-models cc-switch` if needed. |
 | `pi --provider cc-switch-claude --model current` | Start Pi with the Claude provider and follow the current model selected in cc-switch. |
 | `pi --provider cc-switch-claude --model mimo-v2.5-pro` | Start Pi with a concrete Claude model imported from cc-switch. Replace it with the one shown by `pi --list-models cc-switch`. |
+| `pi --provider claude-cli --model current` | Start Pi with the Claude Code subprocess provider. Useful for Claude Code-specific relays that do not behave like standard Anthropic-compatible APIs. |
 | `/cc-switch` | Show the import status of cc-switch Codex and Claude providers inside Pi. |
 | `/model` | Pi built-in command for selecting or switching models inside Pi. |
 
@@ -50,6 +51,7 @@ pi
 pi --provider cc-switch-codex --model gpt-5.5
 pi --provider cc-switch-claude --model current
 pi --provider cc-switch-claude --model mimo-v2.5-pro
+pi --provider claude-cli --model current
 ```
 
 Inside Pi:
@@ -210,6 +212,26 @@ The extension registers `cc-switch-claude/current`, which re-reads `%USERPROFILE
 
 To add extra fixed models, set `PI_CC_SWITCH_CLAUDE_MODELS` in cc-switch's Claude env config as a comma- or space-separated list.
 
+### Claude CLI Provider
+
+The extension also registers `claude-cli/current`. This provider does not send Anthropic HTTP requests itself. Instead, it launches the local Claude Code CLI as a subprocess:
+
+```powershell
+pi --provider claude-cli --model current
+```
+
+By default, it passes only the latest user message to `claude -p` and streams Claude Code's stdout back into Pi. This is useful when a relay works in Claude Code but fails when called as a normal Anthropic-compatible API from Pi.
+
+Environment variables:
+
+| Variable | Purpose |
+|---|---|
+| `PI_CLAUDE_CLI_COMMAND` | Override the Claude executable path. By default the extension uses the bundled Claude Code executable when present, otherwise `claude`. |
+| `PI_CLAUDE_CLI_EXTRA_ARGS` | Extra arguments passed before `-p`. |
+| `PI_CLAUDE_CLI_FULL_CONTEXT=1` | Pass the full Pi conversation transcript instead of only the latest user message. |
+
+Limitations: this is a text bridge. Claude Code subprocess tools are separate from Pi tools, and Pi cannot directly handle Claude Code subprocess tool calls.
+
 ### Security
 
 Do not commit cc-switch credentials. This package only reads local files created by cc-switch:
@@ -255,6 +277,7 @@ pi install git:github.com/Ginkgoooo/pi-cc-switch-provider
 | `pi --provider cc-switch-codex --model gpt-5.5` | 使用 cc-switch 导入的 Codex provider 启动 Pi。如实际模型不同，可替换为 `pi --list-models cc-switch` 显示的模型。 |
 | `pi --provider cc-switch-claude --model current` | 使用 cc-switch 导入的 Claude provider，并跟随 cc-switch 当前选择的模型。 |
 | `pi --provider cc-switch-claude --model mimo-v2.5-pro` | 使用 cc-switch 导入的 Claude provider 和具体模型启动 Pi。可替换为 `pi --list-models cc-switch` 显示的模型。 |
+| `pi --provider claude-cli --model current` | 使用 Claude Code 子进程 provider 启动 Pi。适用于某些只稳定兼容 Claude Code、不完全兼容标准 Anthropic API 的中转。 |
 | `/cc-switch` | 在 Pi 内查看 cc-switch Codex 和 Claude provider 的导入状态。 |
 | `/model` | Pi 内置命令，用于在 Pi 内选择或切换模型。 |
 
@@ -266,6 +289,7 @@ pi
 pi --provider cc-switch-codex --model gpt-5.5
 pi --provider cc-switch-claude --model current
 pi --provider cc-switch-claude --model mimo-v2.5-pro
+pi --provider claude-cli --model current
 ```
 
 在 Pi 内运行：
@@ -425,6 +449,26 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 该扩展会注册 `cc-switch-claude/current`，并在每次请求前重新读取 `%USERPROFILE%\.claude\settings.json`，跟随 cc-switch 当前选择的模型。它也会注册 cc-switch 当前写入的具体模型，例如 `mimo-v2.5-pro`。
 
 如需追加固定模型，可在 cc-switch 的 Claude env 配置中设置 `PI_CC_SWITCH_CLAUDE_MODELS`，使用英文逗号或空格分隔多个模型。
+
+### Claude CLI Provider
+
+该扩展还会注册 `claude-cli/current`。这个 provider 不直接发送 Anthropic HTTP 请求，而是启动本机 Claude Code CLI 子进程：
+
+```powershell
+pi --provider claude-cli --model current
+```
+
+默认只把最新一条用户消息传给 `claude -p`，并把 Claude Code 的 stdout 流式回传给 Pi。它适用于某些在 Claude Code 中可用、但用标准 Anthropic API 方式从 Pi 调用会失败的中转。
+
+环境变量：
+
+| 变量 | 作用 |
+|---|---|
+| `PI_CLAUDE_CLI_COMMAND` | 覆盖 Claude 可执行文件路径。默认优先使用本机已安装的 Claude Code 可执行文件，否则使用 `claude`。 |
+| `PI_CLAUDE_CLI_EXTRA_ARGS` | 传给 `claude -p` 之前的额外参数。 |
+| `PI_CLAUDE_CLI_FULL_CONTEXT=1` | 传完整 Pi 对话记录，而不是只传最新一条用户消息。 |
+
+限制：这是文本桥接方案。Claude Code 子进程里的工具系统和 Pi 工具系统是分离的，Pi 不能直接接管 Claude Code 子进程产生的工具调用。
 
 ### 安全说明
 

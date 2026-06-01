@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -1501,6 +1502,113 @@ function streamCcSwitchAnthropic(
 	return stream;
 }
 
+function contentToPromptText(content: string | (TextContent | ImageContent)[]): string {
+	if (typeof content === "string") return content;
+	return content.map((block) => block.type === "text" ? block.text : `[image:${block.mimeType}]`).join("\n");
+}
+
+function contextToClaudeCliPrompt(context: Context): string {
+	if (process.env.PI_CLAUDE_CLI_FULL_CONTEXT !== "1") {
+		for (let i = context.messages.length - 1; i >= 0; i -= 1) {
+			const message = context.messages[i];
+			if (message.role === "user") return contentToPromptText(message.content);
+		}
+		return "";
+	}
+	const parts: string[] = [];
+	for (const message of context.messages) {
+		if (message.role === "user") parts.push(`User:\n${contentToPromptText(message.content)}`);
+		else if (message.role === "assistant") {
+			const text = message.content.filter((block): block is TextContent => block.type === "text").map((block) => block.text).join("\n");
+			if (text.trim()) parts.push(`Assistant:\n${text}`);
+		} else if (message.role === "toolResult") {
+			parts.push(`Tool result for ${message.toolCallId}:\n${contentToPromptText(message.content)}`);
+		}
+	}
+	return parts.join("\n\n");
+}
+
+function streamClaudeCli(_model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+	const stream = createAssistantMessageEventStream();
+	(async () => {
+		const output: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: "anthropic-messages" as Api,
+			provider: "claude-cli",
+			model: "current",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		try {
+			const prompt = contextToClaudeCliPrompt(context);
+			const bundledClaudeExe = "D:/ProgramFiles/nvm/v20.20.2/node_modules/@anthropic-ai/claude-code/bin/claude.exe";
+			const command = process.env.PI_CLAUDE_CLI_COMMAND || (existsSync(bundledClaudeExe) ? bundledClaudeExe : "claude");
+			const extraArgs = (process.env.PI_CLAUDE_CLI_EXTRA_ARGS || "").split(/\s+/).filter(Boolean);
+			const args = [...extraArgs, "-p", prompt];
+			const useShell = !command.toLowerCase().endsWith(".exe");
+			console.error("[claude-cli provider]", JSON.stringify({ command, args: [...extraArgs, "-p", `<prompt:${prompt.length}>`], cwd: process.cwd(), shell: useShell, timestamp: new Date().toISOString() }, null, 2));
+			const child = spawn(command, args, { cwd: process.cwd(), shell: useShell, windowsHide: true, env: process.env });
+			let stderr = "";
+			let text = "";
+			let started = false;
+			const abort = () => child.kill();
+			options?.signal?.addEventListener("abort", abort, { once: true });
+			child.stdout.on("data", (chunk) => {
+				const delta = Buffer.from(chunk).toString("utf8");
+				if (!started) {
+					started = true;
+					output.content.push({ type: "text", text: "" } as TextContent);
+					stream.push({ type: "start", partial: output });
+					stream.push({ type: "text_start", contentIndex: 0, partial: output });
+				}
+				text += delta;
+				(output.content[0] as TextContent).text = text;
+				stream.push({ type: "text_delta", contentIndex: 0, delta, partial: output });
+			});
+			child.stderr.on("data", (chunk) => { stderr += Buffer.from(chunk).toString("utf8"); });
+			child.on("error", (error) => {
+				output.stopReason = "error";
+				output.errorMessage = error.message;
+				stream.push({ type: "error", reason: "error", error: output });
+				stream.end();
+			});
+			child.on("close", (code) => {
+				options?.signal?.removeEventListener("abort", abort);
+				if (options?.signal?.aborted) {
+					output.stopReason = "aborted";
+					output.errorMessage = "Request was aborted";
+					stream.push({ type: "error", reason: "aborted", error: output });
+					stream.end();
+					return;
+				}
+				if (code !== 0) {
+					output.stopReason = "error";
+					output.errorMessage = stderr.trim() || `claude exited with code ${code}`;
+					stream.push({ type: "error", reason: "error", error: output });
+					stream.end();
+					return;
+				}
+				if (!started) {
+					output.content.push({ type: "text", text: "" } as TextContent);
+					stream.push({ type: "start", partial: output });
+					stream.push({ type: "text_start", contentIndex: 0, partial: output });
+				}
+				stream.push({ type: "text_end", contentIndex: 0, content: text, partial: output });
+				stream.push({ type: "done", reason: "stop", message: output });
+				stream.end();
+			});
+		} catch (error) {
+			output.stopReason = "error";
+			output.errorMessage = error instanceof Error ? error.message : String(error);
+			stream.push({ type: "error", reason: "error", error: output });
+			stream.end();
+		}
+	})();
+	return stream;
+}
+
 export default function (pi: ExtensionAPI) {
 	const claude = loadClaudeConfig();
 	if (claude) {
@@ -1529,6 +1637,23 @@ export default function (pi: ExtensionAPI) {
 				streamCcSwitchAnthropic(claude.authKind, model, context, options),
 		});
 	}
+
+	pi.registerProvider("claude-cli", {
+		name: "Claude CLI",
+		baseUrl: "claude-cli",
+		apiKey: "not-used",
+		api: "anthropic-messages" as Api,
+		models: [{
+			id: "current",
+			name: "Claude CLI (current)",
+			reasoning: true,
+			input: TEXT_IMAGE_INPUT,
+			cost: ZERO_COST,
+			contextWindow: 1000000,
+			maxTokens: 64000,
+		}],
+		streamSimple: (model, context, options) => streamClaudeCli(model, context, options),
+	});
 
 	const codex = loadCodexConfig();
 	if (codex) {
