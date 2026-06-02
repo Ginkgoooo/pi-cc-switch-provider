@@ -60,6 +60,9 @@ const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const TEXT_INPUT = ["text"] as ("text" | "image")[];
 const TEXT_IMAGE_INPUT = ["text", "image"] as ("text" | "image")[];
 const CURRENT_CLAUDE_MODEL_ID = "current";
+const DEFAULT_CLAUDE_OPUS_MODEL = "claude-opus-4-8";
+const DEFAULT_CLAUDE_SONNET_MODEL = "claude-sonnet-4-6";
+const DEFAULT_CLAUDE_HAIKU_MODEL = "claude-haiku-4-5-20251001";
 const CONTEXT_1M_BETA = "context-1m-2025-08-07";
 const CLAUDE_CODE_BETAS = [
 	"claude-code-20250219",
@@ -152,7 +155,43 @@ function currentClaudeModelFromEnv(env: Record<string, unknown>): string | undef
 	);
 }
 
-function extractClaudeFromEnv(env: Record<string, unknown>): ExtractResult<ClaudeConfig> {
+function claudeModelSuffix(model: string): string {
+	return model.match(/\[[^\]]+\]\s*$/)?.[0].trim() ?? "";
+}
+
+function stripClaudeModelSuffix(model: string): string {
+	return model.replace(/\[[^\]]+\]\s*$/, "").trim();
+}
+
+function withClaudeModelSuffix(model: string, suffix: string): string {
+	if (!suffix) return model;
+	return `${stripClaudeModelSuffix(model)}${suffix}`;
+}
+
+function resolveClaudeSettingsModel(settingsModel: unknown, env: Record<string, unknown>): string | undefined {
+	const model = stringValue(settingsModel);
+	if (!model) return undefined;
+
+	const suffix = claudeModelSuffix(model);
+	const baseModel = stripClaudeModelSuffix(model);
+	const normalized = baseModel.toLowerCase();
+	if (normalized === "opus" || normalized === "best") {
+		return withClaudeModelSuffix(stringValue(env.ANTHROPIC_DEFAULT_OPUS_MODEL) ?? DEFAULT_CLAUDE_OPUS_MODEL, suffix);
+	}
+	if (normalized === "sonnet") {
+		return withClaudeModelSuffix(stringValue(env.ANTHROPIC_DEFAULT_SONNET_MODEL) ?? DEFAULT_CLAUDE_SONNET_MODEL, suffix);
+	}
+	if (normalized === "haiku") {
+		return withClaudeModelSuffix(stringValue(env.ANTHROPIC_DEFAULT_HAIKU_MODEL) ?? DEFAULT_CLAUDE_HAIKU_MODEL, suffix);
+	}
+	return model;
+}
+
+function currentClaudeModelFromSettings(settings: Record<string, unknown>, env: Record<string, unknown>): string | undefined {
+	return currentClaudeModelFromEnv(env) ?? resolveClaudeSettingsModel(settings.model, env);
+}
+
+function extractClaudeFromSettings(settings: Record<string, unknown>, env: Record<string, unknown>): ExtractResult<ClaudeConfig> {
 	const baseUrl = stringValue(env.ANTHROPIC_BASE_URL);
 	const authToken = stringValue(env.ANTHROPIC_AUTH_TOKEN);
 	const apiKey = stringValue(env.ANTHROPIC_API_KEY);
@@ -161,7 +200,7 @@ function extractClaudeFromEnv(env: Record<string, unknown>): ExtractResult<Claud
 		return { ok: false, error: "neither env.ANTHROPIC_AUTH_TOKEN nor env.ANTHROPIC_API_KEY is set" };
 	}
 
-	const currentModel = currentClaudeModelFromEnv(env);
+	const currentModel = currentClaudeModelFromSettings(settings, env);
 	return {
 		ok: true,
 		config: {
@@ -229,7 +268,7 @@ function loadClaudeConfig(): ClaudeConfig | undefined {
 		loadDiagnostics.claude = `Claude: ~/.claude/settings.json missing 'env' object`;
 		return undefined;
 	}
-	const result = extractClaudeFromEnv(env);
+	const result = extractClaudeFromSettings(settings, env);
 	if (!result.ok) {
 		loadDiagnostics.claude = `Claude: ${result.error}`;
 		return undefined;
@@ -375,8 +414,10 @@ function supportsOneMillionContext(modelId: string): boolean {
 	return Boolean(sonnetMatch && Number(sonnetMatch[1]) >= 6);
 }
 
-function anthropicBetaHeader(modelId: string): string | undefined {
-	return supportsOneMillionContext(modelId) ? CLAUDE_CODE_BETAS.join(",") : undefined;
+function anthropicBetaHeader(modelId: string, _reasoning: SimpleStreamOptions["reasoning"]): string | undefined {
+	if (!supportsOneMillionContext(modelId)) return undefined;
+	// Claude Code 账号/中转需要 CLI 兼容 beta 和 x-app/session 头；reasoning off 时只是不发 thinking payload。
+	return CLAUDE_CODE_BETAS.join(",");
 }
 
 function claudeContextWindow(modelId: string): number {
@@ -1406,7 +1447,7 @@ function streamCcSwitchAnthropic(
 				"x-stainless-timeout": "600",
 			};
 			const requestModel = resolveClaudeRequestModel(runtimeModel.id);
-			const betaHeader = anthropicBetaHeader(requestModel);
+			const betaHeader = anthropicBetaHeader(requestModel, options?.reasoning);
 			if (betaHeader) {
 				headers["anthropic-beta"] = betaHeader;
 			}
