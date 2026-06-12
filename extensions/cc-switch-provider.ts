@@ -403,11 +403,16 @@ function endpointForAnthropicMessages(baseUrl: string): string {
  * 是否为支持 1M 上下文 + Claude Code beta 的模型。
  *
  * 数据来源：@earendil-works/pi-ai 的 models.generated.js 中 contextWindow=1000000 的 anthropic-messages 条目。
- * 当前只有 4-6+ 系列；4-5 及更早仍是 200K，不要在 4-5 上开 1M beta 否则会被网关拒掉。
+ * 当前只有 4-6+ 系列和 Claude 5 家族；4-5 及更早仍是 200K，不要在 4-5 上开 1M beta 否则会被网关拒掉。
  * 允许带版本/日期后缀（如 "claude-opus-4-7-20251201" / "claude-opus-4-6-v1"）。
  */
 function supportsOneMillionContext(modelId: string): boolean {
 	const normalized = modelId.toLowerCase().replace(/\./g, "-");
+	// 模型 ID 显式带 [1m] 后缀（Claude Code 命名惯例，如 "claude-fable-5[1m]"），
+	// 本身就是 1M 变体，必须启用 1M beta，否则网关会 400 拒绝
+	if (normalized.includes("[1m]")) return true;
+	// Claude 5+ 家族（fable/mythos/opus/sonnet）全部支持 1M 上下文
+	if (/(?:^|[^a-z])claude-(?:fable|mythos|opus|sonnet)-([5-9])(?:\D|$)/.test(normalized)) return true;
 	const opusMatch = normalized.match(/(?:^|[^a-z])claude-opus-4-(\d+)(?:\D|$)/);
 	if (opusMatch && Number(opusMatch[1]) >= 6) return true;
 	const sonnetMatch = normalized.match(/(?:^|[^a-z])claude-sonnet-4-(\d+)(?:\D|$)/);
