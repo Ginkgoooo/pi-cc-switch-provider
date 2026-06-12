@@ -452,7 +452,10 @@ function resolveRuntimeClaudeModel(model: Model<Api>, liveConfig?: ClaudeConfig)
 }
 
 function resolveClaudeRequestModel(modelId: string): string {
-	return modelId;
+	// "[1m]" 后缀是 Claude Code 客户端的内部命名（表示 1M 上下文变体），不是真实 API 模型名。
+	// 真实请求必须剥掉后缀，1M 能力由 anthropic-beta: context-1m-2025-08-07 头表达（与官方 CLI 行为一致）。
+	// 原样透传会让 oneapi 类中转按 "claude-fable-5[1m]" 匹配渠道失败，返回 429 Service Unavailable。
+	return modelId.replace(/\[1m\]\s*$/i, "");
 }
 
 function sanitizeText(text: string): string {
