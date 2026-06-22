@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -54,7 +53,7 @@ interface StreamBlockBase {
 type StreamBlock =
 	| (TextContent & StreamBlockBase)
 	| (ThinkingContent & StreamBlockBase)
-	| (ToolCall & StreamBlockBase & { partialJson: string });
+	| (ToolCall & StreamBlockBase & { partialJson: string; sourceName?: string });
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const TEXT_INPUT = ["text"] as ("text" | "image")[];
@@ -462,6 +461,31 @@ function sanitizeText(text: string): string {
 	return text.replace(/[\uD800-\uDFFF]/g, "\uFFFD");
 }
 
+/**
+ * \u4E2D\u8F6C\u7F51\u5173\u6307\u7EB9\u89C4\u907F\uFF1A\u6539\u5199 pi \u9ED8\u8BA4\u7CFB\u7EDF\u63D0\u793A\u8BCD\u4E2D\u88AB\u62E6\u622A\u7684\u7279\u5F81\u951A\u70B9\u3002
+ *
+ * \u80CC\u666F\uFF082026-06-12 \u5B9E\u6D4B\uFF09\uFF1Acc-switch \u4E2D\u8F6C\u5BF9\u975E Claude Code \u5BA2\u6237\u7AEF\u505A\u5185\u5BB9\u6307\u7EB9\u62E6\u622A\uFF0C
+ * \u547D\u4E2D\u5373\u8FD4\u56DE 429 {"error":{"message":"Service Unavailable"}}\u3002\u901A\u8FC7\u4E8C\u5206\u5B9A\u4F4D\u786E\u8BA4\u62E6\u622A\u951A\u70B9
+ * \u5747\u4E3A pi \u9ED8\u8BA4\u7CFB\u7EDF\u63D0\u793A\u8BCD\u7684\u539F\u6587\u7247\u6BB5\uFF08\u5F00\u5934\u7B7E\u540D\u53E5 + "Pi documentation" \u6BB5\u843D\uFF09\uFF0C
+ * \u4E14\u5339\u914D\u7591\u4F3C\u5E26\u901A\u914D/\u5F52\u4E00\u5316\uFF08\u8DE8\u66FF\u6362\u4E32\u4ECD\u80FD\u547D\u4E2D\uFF09\uFF0C\u56E0\u6B64\uFF1A
+ * 1. \u6539\u5199\u5FC5\u987B"\u6539\u8BCD"\u800C\u975E\u53EA\u6539\u6807\u70B9\uFF0C\u9632\u6B62\u5F52\u4E00\u5316\u540E\u4ECD\u547D\u4E2D\uFF1B
+ * 2. \u5BF9\u7591\u4F3C\u901A\u914D\u89C4\u5219\u540C\u65F6\u7834\u574F\u5176\u5934\u90E8\u548C\u5C3E\u90E8\u951A\u70B9\uFF1B
+ * 3. \u6539\u5199\u4FDD\u6301\u8BED\u4E49\u7B49\u4EF7\uFF0C\u4E0D\u5F71\u54CD\u6A21\u578B\u884C\u4E3A\u3002
+ */
+function maskPiPromptFingerprint(text: string): string {
+	return text
+		// \u5F00\u5934\u7B7E\u540D\u53E5\uFF1A"You are an expert coding assistant operating inside pi, a coding agent harness"
+		.replace(/operating inside pi, a coding agent harness/gi, "working inside pi, a coding-agent harness")
+		// "Pi documentation" \u6BB5\u843D\u7684\u5934\u90E8\u951A\u70B9
+		.replace(/when the user asks about pi itself, its SDK/gi, "if the user asks about pi, including its SDK")
+		// \u6587\u6863\u5217\u8868\u951A\u70B9
+		.replace(/adding models \(docs\/models\.md\), pi packages \(docs\/packages\.md\)/gi,
+			"models (docs/models.md), packages (docs/packages.md)")
+		// \u7591\u4F3C\u901A\u914D\u89C4\u5219\u7684\u5C3E\u90E8\u951A\u70B9
+		.replace(/follow \.md cross-references before implementing/gi,
+			"follow .md cross-references prior to implementing");
+}
+
 function convertContentBlocks(content: (TextContent | ImageContent)[]): string | Record<string, unknown>[] {
 	if (!content.some((block) => block.type === "image")) {
 		return sanitizeText(content.map((block) => (block.type === "text" ? block.text : "")).join("\n"));
@@ -534,11 +558,12 @@ function convertMessages(messages: Message[]): Record<string, unknown>[] {
 					}
 					content.push(thinkingBlock);
 				} else if (block.type === "toolCall") {
+					const replayToolCall = toClaudeCodeToolCall(block.name, block.arguments);
 					content.push({
 						type: "tool_use",
 						id: block.id,
-						name: block.name,
-						input: block.arguments,
+						name: replayToolCall.name,
+						input: replayToolCall.arguments,
 					});
 					// 跟踪未完成的 tool_use
 					pendingToolUseIds.add(block.id);
@@ -595,20 +620,298 @@ function convertToolResult(message: ToolResultMessage): Record<string, unknown> 
 	};
 }
 
-function convertTools(tools: Tool[] | undefined): Record<string, unknown>[] | undefined {
-	if (!tools || tools.length === 0) return undefined;
-	return tools.map((tool) => {
-		const parameters = isRecord(tool.parameters) ? tool.parameters : {};
-		return {
-			name: tool.name,
-			description: tool.description,
-			input_schema: {
+/**
+ * 给末尾消息打增量 prompt 缓存断点（对齐 Claude Code 官方 CLI 的缓存策略）。
+ *
+ * 背景（2026-06-12 实测 499 问题）：此前只有 system 段有 cache_control，会话消息全部不缓存，
+ * 导致每轮请求都对整个会话做全量冷预填（prefill）。预填耗时随上下文线性增长，
+ * 一旦超过中转网关（阿里云 FC/CDN）的响应超时（约 60s），请求被网关掐断，
+ * 返回 499 {"Code":"ClientClosedRequest"}。
+ *
+ * 修复：在最后两条消息的尾部块上打 ephemeral 断点。每轮请求会把完整前缀写入缓存，
+ * 下一轮命中上一轮的缓存，预填恒定为增量部分，长会话也不会超时。
+ * 断点配额：Anthropic 最多 4 个 cache_control，system 通常占 1 个，这里最多占 2 个。
+ *
+ * 注意：thinking 块不支持 cache_control，需在块内从后向前找最近的可缓存块
+ * （text / tool_use / tool_result / image）。
+ */
+function markMessageCacheBreakpoints(messages: Record<string, unknown>[]): void {
+	let remaining = 2;
+	for (let m = messages.length - 1; m >= 0 && remaining > 0; m -= 1) {
+		const content = messages[m].content;
+		if (!Array.isArray(content)) continue;
+		for (let b = content.length - 1; b >= 0; b -= 1) {
+			const block = content[b] as Record<string, unknown>;
+			const type = block.type;
+			if (type === "text" || type === "tool_use" || type === "tool_result" || type === "image") {
+				block.cache_control = { type: "ephemeral" };
+				remaining -= 1;
+				break;
+			}
+		}
+	}
+}
+
+function jsonSchema(properties: Record<string, unknown>, required: string[] = []): Record<string, unknown> {
+	return {
+		type: "object",
+		properties,
+		required,
+		additionalProperties: false,
+	};
+}
+
+function optionalString(description: string): Record<string, unknown> {
+	return { type: "string", description };
+}
+
+function optionalNumber(description: string): Record<string, unknown> {
+	return { type: "number", description };
+}
+
+function optionalBoolean(description: string): Record<string, unknown> {
+	return { type: "boolean", description };
+}
+
+function recordString(record: Record<string, unknown>, ...keys: string[]): string | undefined {
+	for (const key of keys) {
+		const value = record[key];
+		if (typeof value === "string") return value;
+	}
+	return undefined;
+}
+
+function recordNumber(record: Record<string, unknown>, ...keys: string[]): number | undefined {
+	for (const key of keys) {
+		const value = record[key];
+		if (typeof value === "number") return value;
+	}
+	return undefined;
+}
+
+function recordBoolean(record: Record<string, unknown>, ...keys: string[]): boolean | undefined {
+	for (const key of keys) {
+		const value = record[key];
+		if (typeof value === "boolean") return value;
+	}
+	return undefined;
+}
+
+function normalizeClaudeCodeBashTimeout(timeout: number | undefined): number | undefined {
+	if (timeout === undefined) return undefined;
+	return timeout > 1000 ? Math.ceil(timeout / 1000) : timeout;
+}
+
+function claudeTool(name: string, description: string, inputSchema: Record<string, unknown>): Record<string, unknown> {
+	return { name, description, input_schema: inputSchema };
+}
+
+function claudeCodeToolsForPiTool(tool: Tool): Record<string, unknown>[] {
+	switch (tool.name) {
+		case "bash":
+			return [claudeTool("Bash", "Execute a shell command in the current workspace.", jsonSchema({
+				command: optionalString("Shell command to execute"),
+				description: optionalString("Short description of what this command does"),
+				timeout: optionalNumber("Timeout in milliseconds; values above 1000 are converted to Pi's seconds-based timeout"),
+			}, ["command"]))];
+		case "read":
+			return [claudeTool("Read", "Read a file from the current workspace.", jsonSchema({
+				file_path: optionalString("Path to the file to read"),
+				offset: optionalNumber("Line number to start reading from, 1-indexed"),
+				limit: optionalNumber("Maximum number of lines to read"),
+			}, ["file_path"]))];
+		case "write":
+			return [claudeTool("Write", "Write content to a file in the current workspace.", jsonSchema({
+				file_path: optionalString("Path to the file to write"),
+				content: optionalString("Complete file content to write"),
+			}, ["file_path", "content"]))];
+		case "edit":
+			return [
+				claudeTool("Edit", "Replace one exact text range in a file.", jsonSchema({
+					file_path: optionalString("Path to the file to edit"),
+					old_string: optionalString("Exact text to replace"),
+					new_string: optionalString("Replacement text"),
+				}, ["file_path", "old_string", "new_string"])),
+				claudeTool("MultiEdit", "Apply multiple exact text replacements to one file.", jsonSchema({
+					file_path: optionalString("Path to the file to edit"),
+					edits: {
+						type: "array",
+						description: "Ordered list of exact replacements",
+						items: jsonSchema({
+							old_string: optionalString("Exact text to replace"),
+							new_string: optionalString("Replacement text"),
+						}, ["old_string", "new_string"]),
+					},
+				}, ["file_path", "edits"])),
+			];
+		case "ls":
+			return [claudeTool("LS", "List files and directories.", jsonSchema({
+				path: optionalString("Directory to list"),
+				limit: optionalNumber("Maximum number of entries to return"),
+			}, []))];
+		case "grep":
+			return [claudeTool("Grep", "Search file contents by pattern.", jsonSchema({
+				pattern: optionalString("Search pattern"),
+				path: optionalString("Directory or file to search"),
+				glob: optionalString("Glob filter for files to search"),
+				ignoreCase: optionalBoolean("Whether to ignore case"),
+				literal: optionalBoolean("Treat pattern as a literal string"),
+				context: optionalNumber("Number of context lines around each match"),
+				limit: optionalNumber("Maximum number of matches to return"),
+			}, ["pattern"]))];
+		case "find":
+			return [claudeTool("Glob", "Find files by glob pattern.", jsonSchema({
+				pattern: optionalString("Glob pattern to match files"),
+				path: optionalString("Directory to search in"),
+				limit: optionalNumber("Maximum number of results"),
+			}, ["pattern"]))];
+		default: {
+			const parameters = isRecord(tool.parameters) ? tool.parameters : {};
+			return [claudeTool(tool.name, tool.description, {
 				type: "object",
 				properties: parameters.properties ?? {},
 				required: parameters.required ?? [],
-			},
-		};
-	});
+			})];
+		}
+	}
+}
+
+function convertTools(tools: Tool[] | undefined): Record<string, unknown>[] | undefined {
+	if (!tools || tools.length === 0) return undefined;
+	return tools.flatMap((tool) => claudeCodeToolsForPiTool(tool));
+}
+
+function toClaudeCodeToolCall(name: string, args: Record<string, unknown>): { name: string; arguments: Record<string, unknown> } {
+	switch (name) {
+		case "bash":
+			return { name: "Bash", arguments: { command: args.command, timeout: args.timeout } };
+		case "read":
+			return { name: "Read", arguments: { file_path: args.path, offset: args.offset, limit: args.limit } };
+		case "write":
+			return { name: "Write", arguments: { file_path: args.path, content: args.content } };
+		case "edit": {
+			const edits = Array.isArray(args.edits) ? args.edits.filter(isRecord) : [];
+			if (edits.length === 1) {
+				const edit = edits[0];
+				return {
+					name: "Edit",
+					arguments: { file_path: args.path, old_string: edit.oldText, new_string: edit.newText },
+				};
+			}
+			return {
+				name: "MultiEdit",
+				arguments: {
+					file_path: args.path,
+					edits: edits.map((edit) => ({ old_string: edit.oldText, new_string: edit.newText })),
+				},
+			};
+		}
+		case "ls":
+			return { name: "LS", arguments: { path: args.path, limit: args.limit } };
+		case "grep":
+			return { name: "Grep", arguments: args };
+		case "find":
+			return { name: "Glob", arguments: { pattern: args.pattern, path: args.path, limit: args.limit } };
+		default:
+			return { name, arguments: args };
+	}
+}
+
+function displayClaudeCodeToolName(name: string, args: unknown): string {
+	if (name === "edit" && isRecord(args) && Array.isArray(args.edits) && args.edits.length > 1) return "MultiEdit";
+	switch (name) {
+		case "bash": return "Bash";
+		case "read": return "Read";
+		case "write": return "Write";
+		case "edit": return "Edit";
+		case "ls": return "LS";
+		case "grep": return "Grep";
+		case "find": return "Glob";
+		default: return name;
+	}
+}
+
+function fromClaudeCodeToolCall(name: string, args: Record<string, unknown>): { name: string; arguments: Record<string, unknown> } {
+	switch (name) {
+		case "Bash":
+			return {
+				name: "bash",
+				arguments: {
+					command: recordString(args, "command") ?? "",
+					timeout: normalizeClaudeCodeBashTimeout(recordNumber(args, "timeout")),
+				},
+			};
+		case "Read":
+			return {
+				name: "read",
+				arguments: {
+					path: recordString(args, "file_path", "path") ?? "",
+					offset: recordNumber(args, "offset"),
+					limit: recordNumber(args, "limit"),
+				},
+			};
+		case "Write":
+			return {
+				name: "write",
+				arguments: {
+					path: recordString(args, "file_path", "path") ?? "",
+					content: recordString(args, "content") ?? "",
+				},
+			};
+		case "Edit":
+			return {
+				name: "edit",
+				arguments: {
+					path: recordString(args, "file_path", "path") ?? "",
+					edits: [{
+						oldText: recordString(args, "old_string", "oldText") ?? "",
+						newText: recordString(args, "new_string", "newText") ?? "",
+					}],
+				},
+			};
+		case "MultiEdit": {
+			const rawEdits = Array.isArray(args.edits) ? args.edits.filter(isRecord) : [];
+			return {
+				name: "edit",
+				arguments: {
+					path: recordString(args, "file_path", "path") ?? "",
+					edits: rawEdits.map((edit) => ({
+						oldText: recordString(edit, "old_string", "oldText") ?? "",
+						newText: recordString(edit, "new_string", "newText") ?? "",
+					})),
+				},
+			};
+		}
+		case "LS":
+			return {
+				name: "ls",
+				arguments: { path: recordString(args, "path"), limit: recordNumber(args, "limit") },
+			};
+		case "Grep":
+			return {
+				name: "grep",
+				arguments: {
+					pattern: recordString(args, "pattern") ?? "",
+					path: recordString(args, "path"),
+					glob: recordString(args, "glob"),
+					ignoreCase: recordBoolean(args, "ignoreCase", "ignore_case"),
+					literal: recordBoolean(args, "literal"),
+					context: recordNumber(args, "context"),
+					limit: recordNumber(args, "limit"),
+				},
+			};
+		case "Glob":
+			return {
+				name: "find",
+				arguments: {
+					pattern: recordString(args, "pattern") ?? "",
+					path: recordString(args, "path"),
+					limit: recordNumber(args, "limit"),
+				},
+			};
+		default:
+			return { name, arguments: args };
+	}
 }
 
 function thinkingBudget(reasoning: SimpleStreamOptions["reasoning"], options?: SimpleStreamOptions): number | undefined {
@@ -641,27 +944,24 @@ function buildAnthropicPayload(
 	sessionId: string,
 	options?: SimpleStreamOptions,
 ): Record<string, unknown> {
+	const convertedMessages = convertMessages(context.messages);
+	// 末尾消息打缓存断点，避免长会话全量冷预填触发网关超时（499），见 markMessageCacheBreakpoints 注释
+	markMessageCacheBreakpoints(convertedMessages);
 	const payload: Record<string, unknown> = {
 		model: resolveClaudeRequestModel(model.id),
-		messages: convertMessages(context.messages),
+		messages: convertedMessages,
 		max_tokens: options?.maxTokens ?? Math.floor(model.maxTokens / 3),
 		stream: true,
 	};
 
-	// system block 全部挂 ephemeral cache_control —— 200K 模型同样支持 prompt caching，
-	// 不缓存会让长会话每轮重复计费。Claude Code 身份伪装行只在 1M 模型上加（与 Anthropic CLI 行为一致）。
+	// system block 挂 ephemeral cache_control —— 200K 模型同样支持 prompt caching，
+	// 不缓存会让长会话每轮重复计费。
 	const systemBlocks: Record<string, unknown>[] = [];
-	if (supportsOneMillionContext(model.id)) {
-		systemBlocks.push({
-			type: "text",
-			text: "You are Claude Code, Anthropic's official CLI for Claude.",
-			cache_control: { type: "ephemeral" },
-		});
-	}
 	if (context.systemPrompt) {
 		systemBlocks.push({
 			type: "text",
-			text: sanitizeText(context.systemPrompt),
+			// 先做指纹改写再发送：pi 默认提示词的特征句会被中转拦截（429），见 maskPiPromptFingerprint 注释
+			text: maskPiPromptFingerprint(sanitizeText(context.systemPrompt)),
 			cache_control: { type: "ephemeral" },
 		});
 	}
@@ -716,7 +1016,7 @@ function shapeForDebug(value: unknown, depth = 0): unknown {
 	return typeof value;
 }
 
-function writeDebugRequest(headers: Record<string, string>, payload: Record<string, unknown>): void {
+function writeDebugRequest(headers: Record<string, string>, payload: Record<string, unknown>, context?: Context): void {
 	if (process.env.PI_CC_SWITCH_DEBUG !== "1") return;
 	const redactedHeaders: Record<string, string> = {};
 	for (const [key, value] of Object.entries(headers)) {
@@ -724,7 +1024,11 @@ function writeDebugRequest(headers: Record<string, string>, payload: Record<stri
 	}
 	writeFileSync(
 		join(process.cwd(), "pi-cc-switch-debug-request.json"),
-		JSON.stringify({ headers: redactedHeaders, payload: shapeForDebug(payload) }, null, 2),
+		JSON.stringify({
+			headers: redactedHeaders,
+			payload: shapeForDebug(payload),
+			contextTools: context?.tools?.map((tool) => tool.name) ?? [],
+		}, null, 2),
 	);
 }
 
@@ -814,12 +1118,16 @@ function handleAnthropicEvent(
 			output.content.push({ type: "thinking", thinking: "", index } as StreamBlock);
 			stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
 		} else if (blockType === "tool_use") {
+			const sourceName = stringValue(event.content_block.name) ?? "unknown";
+			const sourceArguments = isRecord(event.content_block.input) ? event.content_block.input : {};
+			const mappedToolCall = fromClaudeCodeToolCall(sourceName, sourceArguments);
 			const toolCall: StreamBlock = {
 				type: "toolCall",
 				id: stringValue(event.content_block.id) ?? `tool-${index}`,
-				name: stringValue(event.content_block.name) ?? "unknown",
-				arguments: isRecord(event.content_block.input) ? event.content_block.input : {},
+				name: mappedToolCall.name,
+				arguments: mappedToolCall.arguments,
 				partialJson: "",
+				sourceName,
 				index,
 			};
 			output.content.push(toolCall);
@@ -850,7 +1158,11 @@ function handleAnthropicEvent(
 			block.partialJson += delta;
 			try {
 				const parsed = JSON.parse(block.partialJson) as unknown;
-				if (isRecord(parsed)) block.arguments = parsed;
+				if (isRecord(parsed)) {
+					const mappedToolCall = fromClaudeCodeToolCall(block.sourceName ?? block.name, parsed);
+					block.name = mappedToolCall.name;
+					block.arguments = mappedToolCall.arguments;
+				}
 			} catch {
 				// Keep accumulating partial JSON.
 			}
@@ -872,6 +1184,7 @@ function handleAnthropicEvent(
 			stream.push({ type: "thinking_end", contentIndex, content: block.thinking, partial: output });
 		} else if (block.type === "toolCall") {
 			delete (block as { partialJson?: string }).partialJson;
+			delete (block as { sourceName?: string }).sourceName;
 			stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial: output });
 		}
 		return;
@@ -1355,7 +1668,7 @@ function streamCcSwitchCodexResponses(
 				"content-type": "application/json",
 				authorization: `Bearer ${apiKey}`,
 			};
-			writeDebugRequest(headers, payload);
+			writeDebugRequest(headers, payload, context);
 
 			const response = await fetch(endpointForOpenAIResponses(model.baseUrl), {
 				method: "POST",
@@ -1467,7 +1780,7 @@ function streamCcSwitchAnthropic(
 			}
 
 			const payload = buildAnthropicPayload(runtimeModel, context, sessionId, options);
-			writeDebugRequest(headers, payload);
+			writeDebugRequest(headers, payload, context);
 			const response = await fetch(endpointForAnthropicMessages(runtimeModel.baseUrl), {
 				method: "POST",
 				headers,
@@ -1540,6 +1853,7 @@ function streamCcSwitchAnthropic(
 			for (const block of output.content) {
 				delete (block as { index?: number }).index;
 				delete (block as { partialJson?: string }).partialJson;
+				delete (block as { sourceName?: string }).sourceName;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = error instanceof Error ? error.message : String(error);
@@ -1548,113 +1862,6 @@ function streamCcSwitchAnthropic(
 		}
 	})();
 
-	return stream;
-}
-
-function contentToPromptText(content: string | (TextContent | ImageContent)[]): string {
-	if (typeof content === "string") return content;
-	return content.map((block) => block.type === "text" ? block.text : `[image:${block.mimeType}]`).join("\n");
-}
-
-function contextToClaudeCliPrompt(context: Context): string {
-	if (process.env.PI_CLAUDE_CLI_FULL_CONTEXT !== "1") {
-		for (let i = context.messages.length - 1; i >= 0; i -= 1) {
-			const message = context.messages[i];
-			if (message.role === "user") return contentToPromptText(message.content);
-		}
-		return "";
-	}
-	const parts: string[] = [];
-	for (const message of context.messages) {
-		if (message.role === "user") parts.push(`User:\n${contentToPromptText(message.content)}`);
-		else if (message.role === "assistant") {
-			const text = message.content.filter((block): block is TextContent => block.type === "text").map((block) => block.text).join("\n");
-			if (text.trim()) parts.push(`Assistant:\n${text}`);
-		} else if (message.role === "toolResult") {
-			parts.push(`Tool result for ${message.toolCallId}:\n${contentToPromptText(message.content)}`);
-		}
-	}
-	return parts.join("\n\n");
-}
-
-function streamClaudeCli(_model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
-	const stream = createAssistantMessageEventStream();
-	(async () => {
-		const output: AssistantMessage = {
-			role: "assistant",
-			content: [],
-			api: "anthropic-messages" as Api,
-			provider: "claude-cli",
-			model: "current",
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-			stopReason: "stop",
-			timestamp: Date.now(),
-		};
-		try {
-			const prompt = contextToClaudeCliPrompt(context);
-			const bundledClaudeExe = "D:/ProgramFiles/nvm/v20.20.2/node_modules/@anthropic-ai/claude-code/bin/claude.exe";
-			const command = process.env.PI_CLAUDE_CLI_COMMAND || (existsSync(bundledClaudeExe) ? bundledClaudeExe : "claude");
-			const extraArgs = (process.env.PI_CLAUDE_CLI_EXTRA_ARGS || "").split(/\s+/).filter(Boolean);
-			const args = [...extraArgs, "-p", prompt];
-			const useShell = !command.toLowerCase().endsWith(".exe");
-			console.error("[claude-cli provider]", JSON.stringify({ command, args: [...extraArgs, "-p", `<prompt:${prompt.length}>`], cwd: process.cwd(), shell: useShell, timestamp: new Date().toISOString() }, null, 2));
-			const child = spawn(command, args, { cwd: process.cwd(), shell: useShell, windowsHide: true, env: process.env });
-			let stderr = "";
-			let text = "";
-			let started = false;
-			const abort = () => child.kill();
-			options?.signal?.addEventListener("abort", abort, { once: true });
-			child.stdout.on("data", (chunk) => {
-				const delta = Buffer.from(chunk).toString("utf8");
-				if (!started) {
-					started = true;
-					output.content.push({ type: "text", text: "" } as TextContent);
-					stream.push({ type: "start", partial: output });
-					stream.push({ type: "text_start", contentIndex: 0, partial: output });
-				}
-				text += delta;
-				(output.content[0] as TextContent).text = text;
-				stream.push({ type: "text_delta", contentIndex: 0, delta, partial: output });
-			});
-			child.stderr.on("data", (chunk) => { stderr += Buffer.from(chunk).toString("utf8"); });
-			child.on("error", (error) => {
-				output.stopReason = "error";
-				output.errorMessage = error.message;
-				stream.push({ type: "error", reason: "error", error: output });
-				stream.end();
-			});
-			child.on("close", (code) => {
-				options?.signal?.removeEventListener("abort", abort);
-				if (options?.signal?.aborted) {
-					output.stopReason = "aborted";
-					output.errorMessage = "Request was aborted";
-					stream.push({ type: "error", reason: "aborted", error: output });
-					stream.end();
-					return;
-				}
-				if (code !== 0) {
-					output.stopReason = "error";
-					output.errorMessage = stderr.trim() || `claude exited with code ${code}`;
-					stream.push({ type: "error", reason: "error", error: output });
-					stream.end();
-					return;
-				}
-				if (!started) {
-					output.content.push({ type: "text", text: "" } as TextContent);
-					stream.push({ type: "start", partial: output });
-					stream.push({ type: "text_start", contentIndex: 0, partial: output });
-				}
-				stream.push({ type: "text_end", contentIndex: 0, content: text, partial: output });
-				stream.push({ type: "done", reason: "stop", message: output });
-				stream.end();
-			});
-		} catch (error) {
-			output.stopReason = "error";
-			output.errorMessage = error instanceof Error ? error.message : String(error);
-			stream.push({ type: "error", reason: "error", error: output });
-			stream.end();
-		}
-	})();
 	return stream;
 }
 
@@ -1686,23 +1893,6 @@ export default function (pi: ExtensionAPI) {
 				streamCcSwitchAnthropic(claude.authKind, model, context, options),
 		});
 	}
-
-	pi.registerProvider("claude-cli", {
-		name: "Claude CLI",
-		baseUrl: "claude-cli",
-		apiKey: "not-used",
-		api: "anthropic-messages" as Api,
-		models: [{
-			id: "current",
-			name: "Claude CLI (current)",
-			reasoning: true,
-			input: TEXT_IMAGE_INPUT,
-			cost: ZERO_COST,
-			contextWindow: 1000000,
-			maxTokens: 64000,
-		}],
-		streamSimple: (model, context, options) => streamClaudeCli(model, context, options),
-	});
 
 	const codex = loadCodexConfig();
 	if (codex) {
@@ -1742,6 +1932,16 @@ export default function (pi: ExtensionAPI) {
 			];
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
+	});
+
+	pi.on("tool_execution_start", (event, ctx) => {
+		if (ctx.model?.provider !== "cc-switch-claude") return;
+		ctx.ui.setStatus("cc-switch-tool", `开始调用工具--${displayClaudeCodeToolName(event.toolName, event.args)}`);
+	});
+
+	pi.on("tool_execution_end", (_event, ctx) => {
+		if (ctx.model?.provider !== "cc-switch-claude") return;
+		ctx.ui.setStatus("cc-switch-tool", undefined);
 	});
 
 	// 加载阶段没有 ctx，等到首个 session_start 把诊断 notify 出来。

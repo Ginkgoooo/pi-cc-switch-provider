@@ -1,0 +1,170 @@
+{
+  "headers": {
+    "accept": "application/json",
+    "content-type": "application/json",
+    "anthropic-version": "2023-06-01",
+    "anthropic-dangerous-direct-browser-access": "true",
+    "user-agent": "claude-cli/2.1.123 (external, cli)",
+    "x-app": "cli",
+    "x-claude-code-session-id": "02b239f6-04c2-4cca-b8bd-feff74d8c3d3",
+    "x-stainless-arch": "x64",
+    "x-stainless-lang": "js",
+    "x-stainless-os": "Windows",
+    "x-stainless-package-version": "0.81.0",
+    "x-stainless-retry-count": "0",
+    "x-stainless-runtime": "node",
+    "x-stainless-runtime-version": "v24.3.0",
+    "x-stainless-timeout": "600",
+    "anthropic-beta": "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,effort-2025-11-24",
+    "Authorization": "<redacted>"
+  },
+  "payload": {
+    "model": "claude-opus-4-8",
+    "messages": {
+      "__arrayLength": 7,
+      "items": [
+        {
+          "role": "user",
+          "content": {
+            "__arrayLength": 1,
+            "items": [
+              {
+                "type": "string",
+                "text": "string"
+              }
+            ]
+          }
+        },
+        {
+          "role": "assistant",
+          "content": {
+            "__arrayLength": 2,
+            "items": [
+              {
+                "type": "string",
+                "thinking": "string",
+                "signature": "string"
+              },
+              {
+                "type": "string",
+                "id": "string",
+                "name": "string",
+                "input": "object"
+              }
+            ]
+          }
+        },
+        {
+          "role": "user",
+          "content": {
+            "__arrayLength": 1,
+            "items": [
+              {
+                "type": "string",
+                "tool_use_id": "string",
+                "content": "string",
+                "is_error": "boolean"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "max_tokens": "<redacted>",
+    "stream": true,
+    "system": {
+      "__arrayLength": 1,
+      "items": [
+        {
+          "type": "text",
+          "text": "<string:2626>",
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        }
+      ]
+    },
+    "tools": {
+      "__arrayLength": 8,
+      "items": [
+        {
+          "name": "Read",
+          "description": "Read a file from the current workspace.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "file_path": "object",
+              "offset": "object",
+              "limit": "object"
+            },
+            "required": {
+              "__arrayLength": 1,
+              "items": [
+                "string"
+              ]
+            },
+            "additionalProperties": false
+          }
+        },
+        {
+          "name": "Bash",
+          "description": "Execute a shell command in the current workspace.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "command": "object",
+              "description": "object",
+              "timeout": "object"
+            },
+            "required": {
+              "__arrayLength": 1,
+              "items": [
+                "string"
+              ]
+            },
+            "additionalProperties": false
+          }
+        },
+        {
+          "name": "Edit",
+          "description": "Replace one exact text range in a file.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "file_path": "object",
+              "old_string": "object",
+              "new_string": "object"
+            },
+            "required": {
+              "__arrayLength": 3,
+              "items": [
+                "string",
+                "string",
+                "string"
+              ]
+            },
+            "additionalProperties": false
+          }
+        }
+      ]
+    },
+    "thinking": {
+      "type": "adaptive"
+    },
+    "output_config": {
+      "effort": "high"
+    },
+    "metadata": {
+      "user_id": "{\"device_id\":\"97c7bd7d60f4f748e8b0cc3bd10f8a25a77852689f117afb3840aaaebbbb7da4\",\"account_uuid\":\"\",\"session_id\":\"02b239f6-04c2-4cca-b8bd-feff74d8c3d3\"}"
+    }
+  },
+  "contextTools": [
+    "read",
+    "bash",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "ls"
+  ]
+}
