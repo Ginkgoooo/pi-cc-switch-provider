@@ -58,6 +58,8 @@ type StreamBlock =
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const TEXT_INPUT = ["text"] as ("text" | "image")[];
 const TEXT_IMAGE_INPUT = ["text", "image"] as ("text" | "image")[];
+const DEFAULT_CODEX_CONTEXT_WINDOW = 200000;
+const CODEX_CONTEXT_WINDOW_ENV = "PI_CC_SWITCH_CODEX_CONTEXT_WINDOW";
 const CURRENT_CLAUDE_MODEL_ID = "current";
 const DEFAULT_CLAUDE_OPUS_MODEL = "claude-opus-4-8";
 const DEFAULT_CLAUDE_SONNET_MODEL = "claude-sonnet-4-6";
@@ -116,6 +118,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function stringValue(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function positiveIntegerEnv(name: string): number | undefined {
+	const raw = process.env[name];
+	if (!raw) return undefined;
+	const value = Number.parseInt(raw, 10);
+	if (Number.isFinite(value) && value > 0) return value;
+	console.warn(`[cc-switch] Ignore invalid ${name}=${raw}; expected a positive integer`);
+	return undefined;
+}
+
+function codexContextWindow(): number {
+	return positiveIntegerEnv(CODEX_CONTEXT_WINDOW_ENV) ?? DEFAULT_CODEX_CONTEXT_WINDOW;
+}
+
+function isSummarizationContext(context: Context): boolean {
+	return /context summarization assistant/i.test(context.systemPrompt ?? "");
 }
 
 function stringContent(value: unknown): string | undefined {
@@ -1368,6 +1387,7 @@ function buildOpenAIResponsesPayload(
 	context: Context,
 	options?: SimpleStreamOptions,
 ): Record<string, unknown> {
+	const summarizationContext = isSummarizationContext(context);
 	const payload: Record<string, unknown> = {
 		model: model.id,
 		input: convertResponsesMessages(model, context),
@@ -1382,7 +1402,10 @@ function buildOpenAIResponsesPayload(
 	const tools = convertResponsesTools(context.tools);
 	if (tools) payload.tools = tools;
 
-	if (model.reasoning) {
+	// Pi compaction/branch-summary requests are recovery paths. Keep them plain text-only
+	// even when the active chat uses reasoning, otherwise some cc-switch Codex
+	// Responses proxies reject the summarization payload as invalid_responses_request.
+	if (model.reasoning && !summarizationContext) {
 		const reasoning = options?.reasoning;
 		if (reasoning && reasoning !== "off") {
 			payload.reasoning = {
@@ -1908,7 +1931,7 @@ export default function (pi: ExtensionAPI) {
 					reasoning: true,
 					input: codex.api === "cc-switch-codex-responses" ? TEXT_IMAGE_INPUT : TEXT_INPUT,
 					cost: ZERO_COST,
-					contextWindow: 1000000,
+					contextWindow: codexContextWindow(),
 					maxTokens: 64000,
 				},
 			],

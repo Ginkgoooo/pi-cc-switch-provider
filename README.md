@@ -214,6 +214,19 @@ To add extra fixed models, set `PI_CC_SWITCH_CLAUDE_MODELS` in cc-switch's Claud
 
 `cc-switch-claude` exposes Pi tools to Claude with Claude Code-compatible tool names such as `Bash`, `Read`, `Edit`, `MultiEdit`, `Write`, `LS`, `Grep`, and `Glob`. Tool execution still happens inside Pi through Pi's built-in tools; this package does not start a Claude Code subprocess.
 
+### Codex Context and Compaction
+
+`cc-switch-codex` uses a conservative default context window of 200,000 tokens. This helps Pi compact before the upstream cc-switch Codex channel rejects a request with `context_length_exceeded`, even if the displayed Codex model advertises a larger cached context.
+
+Set `PI_CC_SWITCH_CODEX_CONTEXT_WINDOW` to override the value, for example:
+
+```powershell
+$env:PI_CC_SWITCH_CODEX_CONTEXT_WINDOW = "256000"
+pi --provider cc-switch-codex --model gpt-5.5
+```
+
+Pi compaction and branch-summary requests are sent to Codex without reasoning, even when the active chat uses a high thinking level. This keeps overflow recovery text-only and avoids `invalid_responses_request` errors from Responses-compatible cc-switch proxies.
+
 ### Security
 
 Do not commit cc-switch credentials. This package only reads local files created by cc-switch:
@@ -434,6 +447,19 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 
 `cc-switch-claude` 会用 `Bash`、`Read`、`Edit`、`MultiEdit`、`Write`、`LS`、`Grep`、`Glob` 等 Claude Code 兼容工具名向 Claude 暴露 Pi 工具。工具执行仍由 Pi 内置工具完成，本包不会启动 Claude Code 子进程。
 
+### Codex 上下文与压缩
+
+`cc-switch-codex` 默认使用保守的 200,000 token 上下文窗口。即使 Codex 模型展示了更大的缓存上下文，这也能让 Pi 在上游 cc-switch Codex 通道返回 `context_length_exceeded` 前提前压缩。
+
+如需覆盖该值，可设置 `PI_CC_SWITCH_CODEX_CONTEXT_WINDOW`，例如：
+
+```powershell
+$env:PI_CC_SWITCH_CODEX_CONTEXT_WINDOW = "256000"
+pi --provider cc-switch-codex --model gpt-5.5
+```
+
+Pi 的上下文压缩和分支摘要请求会以无 reasoning 的纯文本请求发给 Codex，即使当前聊天使用 high thinking。这样可以降低 Responses 兼容 cc-switch 中转在溢出恢复时返回 `invalid_responses_request` 的概率。
+
 ### 安全说明
 
 不要提交 cc-switch 凭据。本包只读取 cc-switch 在本地创建的文件：
@@ -441,5 +467,6 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 - `%USERPROFILE%\.claude\settings.json`
 - `%USERPROFILE%\.codex\auth.json`
 - `%USERPROFILE%\.codex\config.toml`
+
 ### 友情链接
 https://linux.do/
