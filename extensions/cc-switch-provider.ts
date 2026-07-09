@@ -100,17 +100,24 @@ const FCAPP_KEEPWARM_STATUS_KEY = "cc-switch-fcapp-keepwarm";
 // 这样可以无限等待入口名额，同时避免半条 assistant 消息或工具调用被 provider 内部重放。
 
 // FC keepwarm 默认永久开启：扩展加载到 fcapp 配置后立即走一次真实 Responses 请求，随后每分钟用轻量 hi 提问维活。
-// 如需临时关闭，可显式设置 PI_CC_SWITCH_FCAPP_KEEPWARM=0/false/no/off。
+// 初始状态可用 PI_CC_SWITCH_FCAPP_KEEPWARM=0/false/no/off 关闭；运行期可用 /fc 随时切换。
 type FcappKeepwarmMode = "responses" | "models";
 let fcappKeepwarmTimer: ReturnType<typeof setTimeout> | undefined;
 let fcappKeepwarmUrl: string | undefined;
 let fcappKeepwarmModeState: FcappKeepwarmMode | undefined;
 let fcappKeepwarmModel: string | undefined;
 let fcappKeepwarmApiKey: string | undefined;
+let fcappKeepwarmAbortController: AbortController | undefined;
+let fcappKeepwarmRuntimeEnabled: boolean | undefined;
+let fcappKeepwarmLastRequestUrl: string | undefined;
+let fcappKeepwarmLastLabel: string | undefined;
+let fcappKeepwarmLastApiKey: string | undefined;
+let fcappKeepwarmLastModel: string | undefined;
 let fcappKeepwarmGeneration = 0;
 let fcappKeepwarmInFlight = false;
 let fcappKeepwarmLastFailureLogAt = 0;
 let fcappKeepwarmStatusText: string | undefined;
+let fcappKeepwarmLastSuccessStatusText: string | undefined;
 let fcappKeepwarmStatusSink: ((text: string | undefined) => void) | undefined;
 let fcappKeepwarmAttemptCount = 0;
 let fcappKeepwarmSuccessCount = 0;
@@ -286,10 +293,14 @@ async function fetchWithFcappAdmissionRetry(url: string, init: RequestInit, labe
 	}
 }
 
-function fcappKeepwarmEnabled(): boolean {
+function fcappKeepwarmEnabledFromEnv(): boolean {
 	const raw = process.env[FCAPP_KEEPWARM_ENABLED_ENV]?.trim();
 	if (!raw) return true;
 	return !/^(0|false|no|off)$/i.test(raw);
+}
+
+function fcappKeepwarmEnabled(): boolean {
+	return fcappKeepwarmRuntimeEnabled ?? fcappKeepwarmEnabledFromEnv();
 }
 
 function fcappKeepwarmMode(): FcappKeepwarmMode {
@@ -346,8 +357,8 @@ function fcappKeepwarmPath(): "/v1/models" | "/healthz" | "/" {
 	return "/v1/models";
 }
 
-function fcappKeepwarmEndpointFor(requestUrl: string, mode: FcappKeepwarmMode): string | undefined {
-	if (!fcappKeepwarmEnabled() || !isFcappAdmissionRetryEndpoint(requestUrl)) return undefined;
+function fcappKeepwarmEndpointFromRequest(requestUrl: string, mode: FcappKeepwarmMode): string | undefined {
+	if (!isFcappAdmissionRetryEndpoint(requestUrl)) return undefined;
 	try {
 		const url = new URL(requestUrl);
 		if (mode === "responses") return url.toString();
@@ -435,7 +446,11 @@ function setFcappKeepwarmStatus(text: string | undefined): void {
 }
 
 function fcappKeepwarmStatusLine(): string {
-	return `FC keepwarm: ${fcappKeepwarmStatusText ?? (fcappKeepwarmEnabled() ? "等待 fcapp 配置" : "已关闭")}`;
+	return fcappKeepwarmStatusText ?? `FC保温: ${fcappKeepwarmEnabled() ? "等待 fcapp 配置" : "已关闭"}`;
+}
+
+function fcappKeepwarmRunActive(generation?: number): boolean {
+	return fcappKeepwarmEnabled() && (generation === undefined || generation === fcappKeepwarmGeneration);
 }
 
 async function runFcappKeepwarm(
@@ -444,18 +459,22 @@ async function runFcappKeepwarm(
 	intervalMs: number | undefined,
 	mode: FcappKeepwarmMode,
 	modelId?: string,
+	generation?: number,
 ): Promise<void> {
 	if (fcappKeepwarmInFlight) return;
+	if (!fcappKeepwarmRunActive(generation)) return;
 	if (mode === "responses" && !modelId) return;
 	fcappKeepwarmInFlight = true;
 	const attempt = ++fcappKeepwarmAttemptCount;
 	const requestUrl = mode === "models" ? fcappKeepwarmRequestUrl(url, attempt) : url;
 	const target = fcappKeepwarmStatusTarget(url, mode, modelId);
 	const controller = new AbortController();
+	fcappKeepwarmAbortController = controller;
 	const timeout = setTimeout(() => controller.abort(), FCAPP_KEEPWARM_TIMEOUT_MS);
 	try {
 		const headers: Record<string, string> = { "cache-control": "no-cache" };
 		if (apiKey) headers.authorization = `Bearer ${apiKey}`;
+		if (!fcappKeepwarmRunActive(generation)) return;
 		setFcappKeepwarmStatus(`FC保温: 请求中 #${fcappKeepwarmSuccessCount}/${attempt} ${target} ${intervalMs ? fcappKeepwarmStatusInterval(intervalMs) : ""}`.trim());
 		if (process.env.PI_CC_SWITCH_DEBUG === "1") {
 			console.info(`[cc-switch] FC keepwarm #${attempt}: ${mode === "responses" ? "POST" : "GET"} ${requestUrl}`);
@@ -479,8 +498,10 @@ async function runFcappKeepwarm(
 			});
 		}
 
+		if (!fcappKeepwarmRunActive(generation)) return;
 		if (!response.ok) {
 			const body = await safeResponseText(response);
+			if (!fcappKeepwarmRunActive(generation)) return;
 			const detail = compactLogText(body);
 			setFcappKeepwarmStatus(`FC保温: 失败 HTTP ${response.status}${detail ? ` ${detail}` : ""} #${fcappKeepwarmSuccessCount}/${attempt} ${target}`);
 			if (shouldLogFcappKeepwarmFailure()) {
@@ -488,10 +509,14 @@ async function runFcappKeepwarm(
 			}
 		} else {
 			await drainResponseBody(response);
+			if (!fcappKeepwarmRunActive(generation)) return;
 			fcappKeepwarmSuccessCount += 1;
-			setFcappKeepwarmStatus(`FC保温: 最近成功 ${fcappKeepwarmStatusTime()} #${fcappKeepwarmSuccessCount}/${attempt} ${target} ${intervalMs ? fcappKeepwarmStatusInterval(intervalMs) : ""}`.trim());
+			const successStatus = `FC保温: 最近成功 ${fcappKeepwarmStatusTime()} #${fcappKeepwarmSuccessCount}/${attempt} ${target} ${intervalMs ? fcappKeepwarmStatusInterval(intervalMs) : ""}`.trim();
+			fcappKeepwarmLastSuccessStatusText = successStatus;
+			setFcappKeepwarmStatus(successStatus);
 		}
 	} catch (error) {
+		if (!fcappKeepwarmRunActive(generation)) return;
 		const message = error instanceof Error ? error.message : String(error);
 		setFcappKeepwarmStatus(`FC保温: 失败 ${message} #${fcappKeepwarmSuccessCount}/${attempt} ${target}`);
 		if (shouldLogFcappKeepwarmFailure()) {
@@ -499,24 +524,36 @@ async function runFcappKeepwarm(
 		}
 	} finally {
 		clearTimeout(timeout);
+		if (fcappKeepwarmAbortController === controller) fcappKeepwarmAbortController = undefined;
 		fcappKeepwarmInFlight = false;
 	}
 }
 
-function startFcappKeepwarm(requestUrl: string, label: string, apiKey?: string, modelId?: string): void {
+function startFcappKeepwarm(requestUrl: string, label: string, apiKey?: string, modelId?: string): boolean {
 	const mode = fcappKeepwarmMode();
-	const keepwarmUrl = fcappKeepwarmEndpointFor(requestUrl, mode);
-	if (!keepwarmUrl) return;
-	if (mode === "responses" && !modelId) return;
+	if (mode === "responses" && !modelId) return false;
+	const keepwarmUrl = fcappKeepwarmEndpointFromRequest(requestUrl, mode);
+	if (!keepwarmUrl) return false;
+
+	// 记录最近一次可用的 FC 配置，便于 /fc 在运行期关闭后无需等下一轮真实请求即可重新开启。
+	fcappKeepwarmLastRequestUrl = requestUrl;
+	fcappKeepwarmLastLabel = label;
+	fcappKeepwarmLastApiKey = apiKey;
+	fcappKeepwarmLastModel = modelId;
+
+	if (!fcappKeepwarmEnabled()) return false;
 	if (
 		fcappKeepwarmTimer &&
 		fcappKeepwarmUrl === keepwarmUrl &&
 		fcappKeepwarmModeState === mode &&
 		fcappKeepwarmModel === modelId &&
 		fcappKeepwarmApiKey === apiKey
-	) return;
+	) return true;
 
-	if (fcappKeepwarmTimer) clearTimeout(fcappKeepwarmTimer);
+	if (fcappKeepwarmTimer) {
+		clearTimeout(fcappKeepwarmTimer);
+		fcappKeepwarmTimer = undefined;
+	}
 	const generation = ++fcappKeepwarmGeneration;
 	fcappKeepwarmUrl = keepwarmUrl;
 	fcappKeepwarmModeState = mode;
@@ -526,15 +563,50 @@ function startFcappKeepwarm(requestUrl: string, label: string, apiKey?: string, 
 	const target = fcappKeepwarmStatusTarget(keepwarmUrl, mode, modelId);
 	setFcappKeepwarmStatus(`FC保温: 运行中 ${target} ${fcappKeepwarmStatusInterval(intervalMs)}`);
 	const scheduleNext = () => {
-		if (generation !== fcappKeepwarmGeneration) return;
+		if (generation !== fcappKeepwarmGeneration || !fcappKeepwarmEnabled()) return;
 		const delayMs = fcappKeepwarmNextDelayMs(intervalMs);
 		fcappKeepwarmTimer = setTimeout(() => {
-			void runFcappKeepwarm(keepwarmUrl, apiKey, intervalMs, mode, modelId).finally(scheduleNext);
+			fcappKeepwarmTimer = undefined;
+			void runFcappKeepwarm(keepwarmUrl, apiKey, intervalMs, mode, modelId, generation).finally(scheduleNext);
 		}, delayMs);
 		(fcappKeepwarmTimer as { unref?: () => void }).unref?.();
 	};
-	void runFcappKeepwarm(keepwarmUrl, apiKey, intervalMs, mode, modelId).finally(scheduleNext);
+	void runFcappKeepwarm(keepwarmUrl, apiKey, intervalMs, mode, modelId, generation).finally(scheduleNext);
 	console.info(`[cc-switch ${label}] FC keepwarm enabled: ${target} every ${intervalMs}ms ±${Math.round(fcappKeepwarmJitterRatio() * 100)}%`);
+	return true;
+}
+
+function stopFcappKeepwarm(): void {
+	if (fcappKeepwarmTimer) {
+		clearTimeout(fcappKeepwarmTimer);
+		fcappKeepwarmTimer = undefined;
+	}
+	fcappKeepwarmGeneration += 1;
+	fcappKeepwarmAbortController?.abort();
+	const lastSuccess = fcappKeepwarmLastSuccessStatusText?.replace(/^FC保温:\s*/, "");
+	setFcappKeepwarmStatus(lastSuccess ? `FC保温: 已关闭；${lastSuccess}` : "FC保温: 已关闭");
+}
+
+function restartFcappKeepwarmFromLastConfig(): boolean {
+	if (!fcappKeepwarmLastRequestUrl || !fcappKeepwarmLastLabel) return false;
+	return startFcappKeepwarm(
+		fcappKeepwarmLastRequestUrl,
+		fcappKeepwarmLastLabel,
+		fcappKeepwarmLastApiKey,
+		fcappKeepwarmLastModel,
+	);
+}
+
+type FcappKeepwarmCommandAction = "toggle" | "on" | "off" | "status";
+
+function parseFcappKeepwarmCommandAction(args: string | undefined): FcappKeepwarmCommandAction | undefined {
+	const value = args?.trim().toLowerCase();
+	if (!value) return "toggle";
+	if (/^(on|enable|enabled|start|1|true|yes|y|开|开启|启动)$/.test(value)) return "on";
+	if (/^(off|disable|disabled|stop|0|false|no|n|关|关闭|停止)$/.test(value)) return "off";
+	if (/^(status|stat|s|状态|查看)$/.test(value)) return "status";
+	if (/^(toggle|t|切换)$/.test(value)) return "toggle";
+	return undefined;
 }
 
 function codexContextWindow(): number {
@@ -2539,6 +2611,38 @@ export default function (pi: ExtensionAPI) {
 				fcappKeepwarmStatusLine(),
 			];
 			ctx.ui.notify(lines.join("\n"), "info");
+		},
+	});
+
+	pi.registerCommand("fc", {
+		description: "Toggle FC keepwarm (/fc, /fc on, /fc off, /fc s)",
+		handler: (args, ctx) => {
+			const action = parseFcappKeepwarmCommandAction(args);
+			if (!action) {
+				ctx.ui.notify("用法：/fc（切换） /fc on /fc off /fc s", "warning");
+				return;
+			}
+			if (action === "status") {
+				ctx.ui.notify(fcappKeepwarmStatusLine(), "info");
+				return;
+			}
+
+			const nextEnabled = action === "toggle" ? !fcappKeepwarmEnabled() : action === "on";
+			fcappKeepwarmRuntimeEnabled = nextEnabled;
+			if (!nextEnabled) {
+				stopFcappKeepwarm();
+				ctx.ui.notify("FC保温已关闭；再次输入 /fc 可开启。", "info");
+				return;
+			}
+
+			const started = restartFcappKeepwarmFromLastConfig();
+			if (started) {
+				ctx.ui.notify(`FC保温已开启。\n${fcappKeepwarmStatusLine()}`, "info");
+				return;
+			}
+
+			setFcappKeepwarmStatus("FC保温: 等待 fcapp 配置");
+			ctx.ui.notify("FC保温已开启；尚未捕获 FC 配置，下一次 cc-switch Codex/Claude 请求后会开始。", "info");
 		},
 	});
 
