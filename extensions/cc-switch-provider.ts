@@ -71,6 +71,13 @@ const CLAUDE_CODE_BETAS = [
 	"interleaved-thinking-2025-05-14",
 	"effort-2025-11-24",
 ];
+const FCAPP_ADMISSION_RETRY_HOST = "a-ocnfniawgw.cn-shanghai.fcapp.run";
+const FCAPP_ADMISSION_RETRY_BASE_DELAY_MS = 1000;
+const FCAPP_ADMISSION_RETRY_MAX_DELAY_MS = 15000;
+const FCAPP_ADMISSION_RETRY_STATUSES = new Set([408, 429, 499, 500, 502, 503, 504]);
+
+// 只对指定 FC 中转站做入场重试：请求拿到可读 SSE 响应后，流中途错误仍交给 Pi 会话级重试处理。
+// 这样可以无限等待入口名额，同时避免半条 assistant 消息或工具调用被 provider 内部重放。
 
 // 加载阶段的诊断信息：扩展启动时没有 ctx，缓存到模块状态，等首个 session_start 再 notify。
 const loadDiagnostics: { claude?: string; codex?: string } = {};
@@ -127,6 +134,120 @@ function positiveIntegerEnv(name: string): number | undefined {
 	if (Number.isFinite(value) && value > 0) return value;
 	console.warn(`[cc-switch] Ignore invalid ${name}=${raw}; expected a positive integer`);
 	return undefined;
+}
+
+function isFcappAdmissionRetryEndpoint(url: string): boolean {
+	try {
+		return new URL(url).hostname.toLowerCase() === FCAPP_ADMISSION_RETRY_HOST;
+	} catch {
+		return url.toLowerCase().includes(FCAPP_ADMISSION_RETRY_HOST);
+	}
+}
+
+function fcappAdmissionRetryDelayMs(attempt: number): number {
+	const exponent = Math.min(attempt - 1, 4);
+	const baseDelay = Math.min(FCAPP_ADMISSION_RETRY_MAX_DELAY_MS, FCAPP_ADMISSION_RETRY_BASE_DELAY_MS * 2 ** exponent);
+	const jitter = 0.85 + Math.random() * 0.3;
+	return Math.min(FCAPP_ADMISSION_RETRY_MAX_DELAY_MS, Math.round(baseDelay * jitter));
+}
+
+function isAbortError(error: unknown): boolean {
+	return error instanceof Error && error.name === "AbortError";
+}
+
+function isFcappAdmissionRetryableError(error: unknown): boolean {
+	if (isAbortError(error)) return false;
+	const message = error instanceof Error ? error.message : String(error);
+	return /fetch failed|timed? out|timeout|ECONNRESET|ECONNREFUSED|socket hang up|terminated|network.?error|connection.?error|connection.?lost|upstream.?connect|reset before headers/i.test(
+		message,
+	);
+}
+
+function shouldLogFcappAdmissionRetry(attempt: number): boolean {
+	return attempt <= 3 || attempt % 10 === 0;
+}
+
+function isFcappAdmissionNonRetryableBody(body: string): boolean {
+	return /insufficient[ _-]?(balance|credit|funds|quota)|available balance|quota exceeded|out of budget|billing|payment required|invalid.?api.?key|unauthorized|forbidden/i.test(
+		body,
+	);
+}
+
+function cloneResponseWithBody(response: Response, body: string): Response {
+	return new Response(body, {
+		status: response.status,
+		statusText: response.statusText,
+		headers: response.headers,
+	});
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+	if (!signal) {
+		return new Promise((resolve) => setTimeout(resolve, ms));
+	}
+	if (signal.aborted) return Promise.reject(new Error("Request was aborted"));
+
+	return new Promise((resolve, reject) => {
+		let timeout: ReturnType<typeof setTimeout>;
+		const onAbort = () => {
+			clearTimeout(timeout);
+			signal.removeEventListener("abort", onAbort);
+			reject(new Error("Request was aborted"));
+		};
+		timeout = setTimeout(() => {
+			signal.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		signal.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+async function safeResponseText(response: Response): Promise<string> {
+	try {
+		return await response.text();
+	} catch (error) {
+		return error instanceof Error ? `<failed to read response body: ${error.message}>` : "<failed to read response body>";
+	}
+}
+
+async function fetchWithFcappAdmissionRetry(url: string, init: RequestInit, label: string): Promise<Response> {
+	if (!isFcappAdmissionRetryEndpoint(url)) {
+		return fetch(url, init);
+	}
+
+	let attempt = 0;
+	while (true) {
+		if (init.signal?.aborted) throw new Error("Request was aborted");
+
+		try {
+			const response = await fetch(url, init);
+			if (!FCAPP_ADMISSION_RETRY_STATUSES.has(response.status)) return response;
+
+			const body = await safeResponseText(response);
+			if (isFcappAdmissionNonRetryableBody(body)) return cloneResponseWithBody(response, body);
+
+			attempt += 1;
+			const delayMs = fcappAdmissionRetryDelayMs(attempt);
+			if (shouldLogFcappAdmissionRetry(attempt)) {
+				console.warn(
+					`[cc-switch ${label}] ${FCAPP_ADMISSION_RETRY_HOST} admission retry #${attempt}: HTTP ${response.status}; retrying in ${delayMs}ms. ${body}`,
+				);
+			}
+			await abortableDelay(delayMs, init.signal ?? undefined);
+		} catch (error) {
+			if (init.signal?.aborted || !isFcappAdmissionRetryableError(error)) throw error;
+
+			attempt += 1;
+			const delayMs = fcappAdmissionRetryDelayMs(attempt);
+			if (shouldLogFcappAdmissionRetry(attempt)) {
+				const message = error instanceof Error ? error.message : String(error);
+				console.warn(
+					`[cc-switch ${label}] ${FCAPP_ADMISSION_RETRY_HOST} admission retry #${attempt}: ${message}; retrying in ${delayMs}ms.`,
+				);
+			}
+			await abortableDelay(delayMs, init.signal ?? undefined);
+		}
+	}
 }
 
 function codexContextWindow(): number {
@@ -1693,12 +1814,12 @@ function streamCcSwitchCodexResponses(
 			};
 			writeDebugRequest(headers, payload, context);
 
-			const response = await fetch(endpointForOpenAIResponses(model.baseUrl), {
+			const response = await fetchWithFcappAdmissionRetry(endpointForOpenAIResponses(model.baseUrl), {
 				method: "POST",
 				headers,
 				body: JSON.stringify(payload),
 				signal: options?.signal,
-			});
+			}, "Codex");
 
 			if (!response.ok) {
 				throw new Error(`cc-switch Codex request failed: ${response.status} ${await response.text()}`);
@@ -1804,12 +1925,12 @@ function streamCcSwitchAnthropic(
 
 			const payload = buildAnthropicPayload(runtimeModel, context, sessionId, options);
 			writeDebugRequest(headers, payload, context);
-			const response = await fetch(endpointForAnthropicMessages(runtimeModel.baseUrl), {
+			const response = await fetchWithFcappAdmissionRetry(endpointForAnthropicMessages(runtimeModel.baseUrl), {
 				method: "POST",
 				headers,
 				body: JSON.stringify(payload),
 				signal: options?.signal,
-			});
+			}, "Claude");
 
 			if (!response.ok) {
 				throw new Error(`cc-switch Claude request failed: ${response.status} ${await response.text()}`);
