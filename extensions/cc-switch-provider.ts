@@ -75,9 +75,21 @@ const FCAPP_ADMISSION_RETRY_HOST = "a-ocnfniawgw.cn-shanghai.fcapp.run";
 const FCAPP_ADMISSION_RETRY_BASE_DELAY_MS = 1000;
 const FCAPP_ADMISSION_RETRY_MAX_DELAY_MS = 15000;
 const FCAPP_ADMISSION_RETRY_STATUSES = new Set([408, 429, 499, 500, 502, 503, 504]);
+const FCAPP_KEEPWARM_ENABLED_ENV = "PI_CC_SWITCH_FCAPP_KEEPWARM";
+const FCAPP_KEEPWARM_INTERVAL_ENV = "PI_CC_SWITCH_FCAPP_KEEPWARM_INTERVAL_MS";
+const FCAPP_KEEPWARM_PATH_ENV = "PI_CC_SWITCH_FCAPP_KEEPWARM_PATH";
+const FCAPP_KEEPWARM_DEFAULT_INTERVAL_MS = 120000;
+const FCAPP_KEEPWARM_TIMEOUT_MS = 15000;
+const FCAPP_KEEPWARM_FAILURE_LOG_INTERVAL_MS = 600000;
 
 // 只对指定 FC 中转站做入场重试：请求拿到可读 SSE 响应后，流中途错误仍交给 Pi 会话级重试处理。
 // 这样可以无限等待入口名额，同时避免半条 assistant 消息或工具调用被 provider 内部重放。
+
+// FC keepwarm 默认关闭；开启后也只在真实请求成功后启动 GET /healthz 或 GET / 保温，不做模型 ping。
+let fcappKeepwarmTimer: ReturnType<typeof setInterval> | undefined;
+let fcappKeepwarmUrl: string | undefined;
+let fcappKeepwarmInFlight = false;
+let fcappKeepwarmLastFailureLogAt = 0;
 
 // 加载阶段的诊断信息：扩展启动时没有 ctx，缓存到模块状态，等首个 session_start 再 notify。
 const loadDiagnostics: { claude?: string; codex?: string } = {};
@@ -248,6 +260,84 @@ async function fetchWithFcappAdmissionRetry(url: string, init: RequestInit, labe
 			await abortableDelay(delayMs, init.signal ?? undefined);
 		}
 	}
+}
+
+function booleanEnvEnabled(name: string): boolean {
+	const raw = process.env[name];
+	if (!raw) return false;
+	return /^(1|true|yes|on)$/i.test(raw.trim());
+}
+
+function fcappKeepwarmIntervalMs(): number {
+	return positiveIntegerEnv(FCAPP_KEEPWARM_INTERVAL_ENV) ?? FCAPP_KEEPWARM_DEFAULT_INTERVAL_MS;
+}
+
+function fcappKeepwarmPath(): "/healthz" | "/" {
+	const raw = process.env[FCAPP_KEEPWARM_PATH_ENV]?.trim();
+	if (!raw) return "/healthz";
+	if (raw === "/healthz" || raw === "/") return raw;
+	console.warn(`[cc-switch] Ignore invalid ${FCAPP_KEEPWARM_PATH_ENV}=${raw}; expected /healthz or /`);
+	return "/healthz";
+}
+
+function fcappKeepwarmEndpointFor(requestUrl: string): string | undefined {
+	if (!booleanEnvEnabled(FCAPP_KEEPWARM_ENABLED_ENV) || !isFcappAdmissionRetryEndpoint(requestUrl)) return undefined;
+	try {
+		const url = new URL(requestUrl);
+		url.pathname = fcappKeepwarmPath();
+		url.search = "";
+		url.hash = "";
+		return url.toString();
+	} catch {
+		return undefined;
+	}
+}
+
+function shouldLogFcappKeepwarmFailure(): boolean {
+	const now = Date.now();
+	if (now - fcappKeepwarmLastFailureLogAt < FCAPP_KEEPWARM_FAILURE_LOG_INTERVAL_MS) return false;
+	fcappKeepwarmLastFailureLogAt = now;
+	return true;
+}
+
+async function runFcappKeepwarm(url: string): Promise<void> {
+	if (fcappKeepwarmInFlight) return;
+	fcappKeepwarmInFlight = true;
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), FCAPP_KEEPWARM_TIMEOUT_MS);
+	try {
+		const response = await fetch(url, {
+			method: "GET",
+			headers: { "cache-control": "no-cache" },
+			signal: controller.signal,
+		});
+		if (!response.ok && shouldLogFcappKeepwarmFailure()) {
+			console.warn(`[cc-switch] FC keepwarm failed: GET ${url} -> HTTP ${response.status}`);
+		}
+	} catch (error) {
+		if (shouldLogFcappKeepwarmFailure()) {
+			const message = error instanceof Error ? error.message : String(error);
+			console.warn(`[cc-switch] FC keepwarm failed: GET ${url} -> ${message}`);
+		}
+	} finally {
+		clearTimeout(timeout);
+		fcappKeepwarmInFlight = false;
+	}
+}
+
+function startFcappKeepwarmAfterSuccessfulRequest(requestUrl: string, label: string): void {
+	const keepwarmUrl = fcappKeepwarmEndpointFor(requestUrl);
+	if (!keepwarmUrl) return;
+	if (fcappKeepwarmTimer && fcappKeepwarmUrl === keepwarmUrl) return;
+
+	if (fcappKeepwarmTimer) clearInterval(fcappKeepwarmTimer);
+	fcappKeepwarmUrl = keepwarmUrl;
+	const intervalMs = fcappKeepwarmIntervalMs();
+	fcappKeepwarmTimer = setInterval(() => {
+		void runFcappKeepwarm(keepwarmUrl);
+	}, intervalMs);
+	(fcappKeepwarmTimer as { unref?: () => void }).unref?.();
+	console.info(`[cc-switch ${label}] FC keepwarm enabled: GET ${keepwarmUrl} every ${intervalMs}ms`);
 }
 
 function codexContextWindow(): number {
@@ -1814,7 +1904,8 @@ function streamCcSwitchCodexResponses(
 			};
 			writeDebugRequest(headers, payload, context);
 
-			const response = await fetchWithFcappAdmissionRetry(endpointForOpenAIResponses(model.baseUrl), {
+			const endpoint = endpointForOpenAIResponses(model.baseUrl);
+			const response = await fetchWithFcappAdmissionRetry(endpoint, {
 				method: "POST",
 				headers,
 				body: JSON.stringify(payload),
@@ -1824,6 +1915,10 @@ function streamCcSwitchCodexResponses(
 			if (!response.ok) {
 				throw new Error(`cc-switch Codex request failed: ${response.status} ${await response.text()}`);
 			}
+			if (!response.body) {
+				throw new Error("cc-switch Codex response did not include a stream body");
+			}
+			startFcappKeepwarmAfterSuccessfulRequest(endpoint, "Codex");
 
 			stream.push({ type: "start", partial: output });
 			await processOpenAIResponsesSse(response, output, stream, model);
@@ -1925,7 +2020,8 @@ function streamCcSwitchAnthropic(
 
 			const payload = buildAnthropicPayload(runtimeModel, context, sessionId, options);
 			writeDebugRequest(headers, payload, context);
-			const response = await fetchWithFcappAdmissionRetry(endpointForAnthropicMessages(runtimeModel.baseUrl), {
+			const endpoint = endpointForAnthropicMessages(runtimeModel.baseUrl);
+			const response = await fetchWithFcappAdmissionRetry(endpoint, {
 				method: "POST",
 				headers,
 				body: JSON.stringify(payload),
@@ -1938,6 +2034,7 @@ function streamCcSwitchAnthropic(
 			if (!response.body) {
 				throw new Error("cc-switch Claude response did not include a stream body");
 			}
+			startFcappKeepwarmAfterSuccessfulRequest(endpoint, "Claude");
 
 			stream.push({ type: "start", partial: output });
 			const reader = response.body.getReader();
