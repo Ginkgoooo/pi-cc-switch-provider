@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -60,6 +60,10 @@ const TEXT_INPUT = ["text"] as ("text" | "image")[];
 const TEXT_IMAGE_INPUT = ["text", "image"] as ("text" | "image")[];
 const DEFAULT_CODEX_CONTEXT_WINDOW = 200000;
 const CODEX_CONTEXT_WINDOW_ENV = "PI_CC_SWITCH_CODEX_CONTEXT_WINDOW";
+const CODEX_SUMMARY_BASE_URL_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_BASE_URL";
+const DEFAULT_CODEX_SUMMARY_BASE_URL = "https://paid.tribiosapi.top/v1";
+const CODEX_SUMMARY_MODEL_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_MODEL";
+const CODEX_SUMMARY_API_KEY_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_API_KEY";
 const CURRENT_CLAUDE_MODEL_ID = "current";
 const DEFAULT_CLAUDE_OPUS_MODEL = "claude-opus-4-8";
 const DEFAULT_CLAUDE_SONNET_MODEL = "claude-sonnet-4-6";
@@ -582,6 +586,93 @@ function parseCodexTomlScalar(raw: string): string | undefined {
 	}
 	// 裸值：true/false/number，按原文返回即可。
 	return raw;
+}
+
+function extractCodexBaseUrlFromConfigText(configText: string): string | undefined {
+	const toml = parseCodexConfigToml(configText);
+	const activeProviderId = toml.top.model_provider;
+	const section = activeProviderId
+		? toml.sections[`model_providers.${activeProviderId}`]
+		: undefined;
+	return section?.base_url ?? toml.top.base_url;
+}
+
+function normalizeUrlForCompare(value: string): string {
+	return value.replace(/\/+$/, "").toLowerCase();
+}
+
+function readCcSwitchDbText(): string | undefined {
+	const dbPath = join(homedir(), ".cc-switch", "cc-switch.db");
+	if (!existsSync(dbPath)) return undefined;
+	try {
+		return readFileSync(dbPath).toString("utf8");
+	} catch {
+		return undefined;
+	}
+}
+
+function decodeCcSwitchConfigText(raw: string): string {
+	return raw
+		.replace(/\\n/g, "\n")
+		.replace(/\\r/g, "\r")
+		.replace(/\\t/g, "\t")
+		.replace(/\\"/g, '"')
+		.replace(/\\\\/g, "\\");
+}
+
+function findCodexProviderInCcSwitchDb(baseUrl: string): { apiKey?: string; model?: string } | undefined {
+	const dbText = readCcSwitchDbText();
+	if (!dbText) return undefined;
+	const target = normalizeUrlForCompare(baseUrl);
+	const pattern = /\{"auth":\{"OPENAI_API_KEY":"([^"]+)"\},"config":"([\s\S]{0,4000}?)"\}https?:\/\//g;
+	let match: RegExpExecArray | null;
+	while ((match = pattern.exec(dbText)) !== null) {
+		const configText = decodeCcSwitchConfigText(match[2]);
+		const configBaseUrl = extractCodexBaseUrlFromConfigText(configText);
+		if (!configBaseUrl || normalizeUrlForCompare(configBaseUrl) !== target) continue;
+		const parsed = parseCodexConfigToml(configText);
+		return {
+			apiKey: match[1],
+			model: parsed.top.model,
+		};
+	}
+	return undefined;
+}
+
+function codexSummaryFallbackBaseUrl(currentBaseUrl: string): string | undefined {
+	const explicit = process.env[CODEX_SUMMARY_BASE_URL_ENV]?.trim();
+	if (explicit) return explicit;
+
+	const current = normalizeUrlForCompare(currentBaseUrl);
+	if (normalizeUrlForCompare(DEFAULT_CODEX_SUMMARY_BASE_URL) !== current) {
+		return DEFAULT_CODEX_SUMMARY_BASE_URL;
+	}
+
+	const codexDir = join(homedir(), ".codex");
+	if (!existsSync(codexDir)) return undefined;
+
+	let files: string[];
+	try {
+		files = readdirSync(codexDir)
+			.filter((name) => /^config\.toml\.bak-/i.test(name))
+			.sort()
+			.reverse();
+	} catch {
+		return undefined;
+	}
+
+	for (const file of files) {
+		try {
+			const baseUrl = extractCodexBaseUrlFromConfigText(readFileSync(join(codexDir, file), "utf8"));
+			if (!baseUrl) continue;
+			if (normalizeUrlForCompare(baseUrl) === current) continue;
+			if (isFcappAdmissionRetryEndpoint(baseUrl)) continue;
+			return baseUrl;
+		} catch {
+			// 忽略不可读或格式不兼容的历史备份，继续尝试其他备份。
+		}
+	}
+	return undefined;
 }
 
 function loadCodexConfig(): CodexConfig | undefined {
@@ -1599,18 +1690,46 @@ function buildOpenAIResponsesPayload(
 	options?: SimpleStreamOptions,
 ): Record<string, unknown> {
 	const summarizationContext = isSummarizationContext(context);
+	const summarizationInstructions = "You are Codex, a coding agent. Produce only the requested structured context summary.";
+	const payloadContext: Context = summarizationContext
+		? {
+			...context,
+			// Codex Responses 官方形态使用顶层 instructions，input 中不放 developer/system 项。
+			systemPrompt: undefined,
+			tools: [],
+		}
+		: context;
 	const payload: Record<string, unknown> = {
 		model: model.id,
-		input: convertResponsesMessages(model, context),
+		input: convertResponsesMessages(model, payloadContext),
 		stream: true,
-		store: false,
-		prompt_cache_key: options?.sessionId,
 	};
+	if (summarizationContext) {
+		payload.instructions = summarizationInstructions;
+		payload.text = { verbosity: "low" };
+		if (isFcappAdmissionRetryEndpoint(model.baseUrl) && model.reasoning) {
+			payload.store = false;
+			payload.prompt_cache_key = options?.sessionId;
+			const reasoning = options?.reasoning;
+			if (reasoning && reasoning !== "off") {
+				payload.reasoning = {
+					effort: model.thinkingLevelMap?.[reasoning] ?? reasoning,
+					summary: "auto",
+				};
+				payload.include = ["reasoning.encrypted_content"];
+			} else if (model.thinkingLevelMap?.off !== null) {
+				payload.reasoning = { effort: model.thinkingLevelMap?.off ?? "none" };
+			}
+		}
+	} else {
+		payload.store = false;
+		payload.prompt_cache_key = options?.sessionId;
+	}
 
 	if (options?.maxTokens) payload.max_output_tokens = options.maxTokens;
 	if (options?.temperature !== undefined) payload.temperature = options.temperature;
 
-	const tools = convertResponsesTools(context.tools);
+	const tools = convertResponsesTools(payloadContext.tools);
 	if (tools) payload.tools = tools;
 
 	// Pi compaction/branch-summary requests are recovery paths. Keep them plain text-only
@@ -1905,7 +2024,7 @@ function streamCcSwitchCodexResponses(
 			writeDebugRequest(headers, payload, context);
 
 			const endpoint = endpointForOpenAIResponses(model.baseUrl);
-			const response = await fetchWithFcappAdmissionRetry(endpoint, {
+			let response = await fetchWithFcappAdmissionRetry(endpoint, {
 				method: "POST",
 				headers,
 				body: JSON.stringify(payload),
@@ -1913,7 +2032,31 @@ function streamCcSwitchCodexResponses(
 			}, "Codex");
 
 			if (!response.ok) {
-				throw new Error(`cc-switch Codex request failed: ${response.status} ${await response.text()}`);
+				const errorText = await response.text();
+				const fallbackBaseUrl = isSummarizationContext(context) && /invalid_responses_request|invalid codex request/i.test(errorText)
+					? codexSummaryFallbackBaseUrl(model.baseUrl)
+					: undefined;
+				if (fallbackBaseUrl) {
+					const fallbackProvider = findCodexProviderInCcSwitchDb(fallbackBaseUrl);
+					const fallbackModelId = process.env[CODEX_SUMMARY_MODEL_ENV]?.trim() || fallbackProvider?.model || model.id;
+					const fallbackPayload = fallbackModelId === model.id ? payload : { ...payload, model: fallbackModelId };
+					const fallbackApiKey = process.env[CODEX_SUMMARY_API_KEY_ENV]?.trim() || fallbackProvider?.apiKey || apiKey;
+					const fallbackHeaders = { ...headers, authorization: `Bearer ${fallbackApiKey}` };
+					const fallbackEndpoint = endpointForOpenAIResponses(fallbackBaseUrl);
+					console.warn(`[cc-switch Codex] compact summary fallback: ${endpoint} -> ${fallbackEndpoint}`);
+					writeDebugRequest(fallbackHeaders, fallbackPayload, context);
+					response = await fetchWithFcappAdmissionRetry(fallbackEndpoint, {
+						method: "POST",
+						headers: fallbackHeaders,
+						body: JSON.stringify(fallbackPayload),
+						signal: options?.signal,
+					}, "Codex summary fallback");
+					if (!response.ok) {
+						throw new Error(`cc-switch Codex request failed: ${response.status} ${await response.text()}`);
+					}
+				} else {
+					throw new Error(`cc-switch Codex request failed: ${response.status} ${errorText}`);
+				}
 			}
 			if (!response.body) {
 				throw new Error("cc-switch Codex response did not include a stream body");
