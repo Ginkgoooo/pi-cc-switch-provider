@@ -85,15 +85,21 @@ const FCAPP_KEEPWARM_PATH_ENV = "PI_CC_SWITCH_FCAPP_KEEPWARM_PATH";
 const FCAPP_KEEPWARM_DEFAULT_INTERVAL_MS = 120000;
 const FCAPP_KEEPWARM_TIMEOUT_MS = 15000;
 const FCAPP_KEEPWARM_FAILURE_LOG_INTERVAL_MS = 600000;
+const FCAPP_KEEPWARM_STATUS_KEY = "cc-switch-fcapp-keepwarm";
 
 // 只对指定 FC 中转站做入场重试：请求拿到可读 SSE 响应后，流中途错误仍交给 Pi 会话级重试处理。
 // 这样可以无限等待入口名额，同时避免半条 assistant 消息或工具调用被 provider 内部重放。
 
-// FC keepwarm 默认关闭；开启后也只在真实请求成功后启动 GET /healthz 或 GET / 保温，不做模型 ping。
+// FC keepwarm 默认永久开启：扩展加载到 fcapp 配置后立即 GET /v1/models，随后按间隔保温，不做模型 ping。
+// 如需临时关闭，可显式设置 PI_CC_SWITCH_FCAPP_KEEPWARM=0/false/no/off。
 let fcappKeepwarmTimer: ReturnType<typeof setInterval> | undefined;
 let fcappKeepwarmUrl: string | undefined;
 let fcappKeepwarmInFlight = false;
 let fcappKeepwarmLastFailureLogAt = 0;
+let fcappKeepwarmStatusText: string | undefined;
+let fcappKeepwarmStatusSink: ((text: string | undefined) => void) | undefined;
+let fcappKeepwarmAttemptCount = 0;
+let fcappKeepwarmSuccessCount = 0;
 
 // 加载阶段的诊断信息：扩展启动时没有 ctx，缓存到模块状态，等首个 session_start 再 notify。
 const loadDiagnostics: { claude?: string; codex?: string } = {};
@@ -266,26 +272,26 @@ async function fetchWithFcappAdmissionRetry(url: string, init: RequestInit, labe
 	}
 }
 
-function booleanEnvEnabled(name: string): boolean {
-	const raw = process.env[name];
-	if (!raw) return false;
-	return /^(1|true|yes|on)$/i.test(raw.trim());
+function fcappKeepwarmEnabled(): boolean {
+	const raw = process.env[FCAPP_KEEPWARM_ENABLED_ENV]?.trim();
+	if (!raw) return true;
+	return !/^(0|false|no|off)$/i.test(raw);
 }
 
 function fcappKeepwarmIntervalMs(): number {
 	return positiveIntegerEnv(FCAPP_KEEPWARM_INTERVAL_ENV) ?? FCAPP_KEEPWARM_DEFAULT_INTERVAL_MS;
 }
 
-function fcappKeepwarmPath(): "/healthz" | "/" {
+function fcappKeepwarmPath(): "/v1/models" | "/healthz" | "/" {
 	const raw = process.env[FCAPP_KEEPWARM_PATH_ENV]?.trim();
-	if (!raw) return "/healthz";
-	if (raw === "/healthz" || raw === "/") return raw;
-	console.warn(`[cc-switch] Ignore invalid ${FCAPP_KEEPWARM_PATH_ENV}=${raw}; expected /healthz or /`);
-	return "/healthz";
+	if (!raw) return "/v1/models";
+	if (raw === "/v1/models" || raw === "/healthz" || raw === "/") return raw;
+	console.warn(`[cc-switch] Ignore invalid ${FCAPP_KEEPWARM_PATH_ENV}=${raw}; expected /v1/models, /healthz or /`);
+	return "/v1/models";
 }
 
 function fcappKeepwarmEndpointFor(requestUrl: string): string | undefined {
-	if (!booleanEnvEnabled(FCAPP_KEEPWARM_ENABLED_ENV) || !isFcappAdmissionRetryEndpoint(requestUrl)) return undefined;
+	if (!fcappKeepwarmEnabled() || !isFcappAdmissionRetryEndpoint(requestUrl)) return undefined;
 	try {
 		const url = new URL(requestUrl);
 		url.pathname = fcappKeepwarmPath();
@@ -304,24 +310,74 @@ function shouldLogFcappKeepwarmFailure(): boolean {
 	return true;
 }
 
-async function runFcappKeepwarm(url: string): Promise<void> {
+function fcappKeepwarmStatusPath(url: string): string {
+	try {
+		return new URL(url).pathname;
+	} catch {
+		return url;
+	}
+}
+
+function fcappKeepwarmStatusInterval(intervalMs: number): string {
+	return `${Math.round(intervalMs / 1000)}s`;
+}
+
+function fcappKeepwarmStatusTime(): string {
+	return new Date().toTimeString().slice(0, 8);
+}
+
+function fcappKeepwarmRequestUrl(url: string, attempt: number): string {
+	try {
+		const requestUrl = new URL(url);
+		requestUrl.searchParams.set("cc_switch_keepwarm", `${Date.now()}-${attempt}`);
+		return requestUrl.toString();
+	} catch {
+		return url;
+	}
+}
+
+function setFcappKeepwarmStatus(text: string | undefined): void {
+	fcappKeepwarmStatusText = text;
+	fcappKeepwarmStatusSink?.(text);
+}
+
+function fcappKeepwarmStatusLine(): string {
+	return `FC keepwarm: ${fcappKeepwarmStatusText ?? (fcappKeepwarmEnabled() ? "等待 fcapp 配置" : "已关闭")}`;
+}
+
+async function runFcappKeepwarm(url: string, apiKey?: string, intervalMs?: number): Promise<void> {
 	if (fcappKeepwarmInFlight) return;
 	fcappKeepwarmInFlight = true;
+	const attempt = ++fcappKeepwarmAttemptCount;
+	const requestUrl = fcappKeepwarmRequestUrl(url, attempt);
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), FCAPP_KEEPWARM_TIMEOUT_MS);
 	try {
-		const response = await fetch(url, {
+		const headers: Record<string, string> = { "cache-control": "no-cache" };
+		if (apiKey) headers.authorization = `Bearer ${apiKey}`;
+		setFcappKeepwarmStatus(`FC保温: 请求中 #${fcappKeepwarmSuccessCount}/${attempt} ${fcappKeepwarmStatusPath(url)} ${intervalMs ? fcappKeepwarmStatusInterval(intervalMs) : ""}`.trim());
+		if (process.env.PI_CC_SWITCH_DEBUG === "1") {
+			console.info(`[cc-switch] FC keepwarm #${attempt}: GET ${requestUrl}`);
+		}
+		const response = await fetch(requestUrl, {
 			method: "GET",
-			headers: { "cache-control": "no-cache" },
+			headers,
 			signal: controller.signal,
 		});
-		if (!response.ok && shouldLogFcappKeepwarmFailure()) {
-			console.warn(`[cc-switch] FC keepwarm failed: GET ${url} -> HTTP ${response.status}`);
+		if (!response.ok) {
+			setFcappKeepwarmStatus(`FC保温: 失败 HTTP ${response.status} #${fcappKeepwarmSuccessCount}/${attempt} ${fcappKeepwarmStatusPath(url)}`);
+			if (shouldLogFcappKeepwarmFailure()) {
+				console.warn(`[cc-switch] FC keepwarm failed: GET ${requestUrl} -> HTTP ${response.status}`);
+			}
+		} else {
+			fcappKeepwarmSuccessCount += 1;
+			setFcappKeepwarmStatus(`FC保温: 最近成功 ${fcappKeepwarmStatusTime()} #${fcappKeepwarmSuccessCount}/${attempt} ${fcappKeepwarmStatusPath(url)} ${intervalMs ? fcappKeepwarmStatusInterval(intervalMs) : ""}`.trim());
 		}
 	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		setFcappKeepwarmStatus(`FC保温: 失败 ${message} #${fcappKeepwarmSuccessCount}/${attempt} ${fcappKeepwarmStatusPath(url)}`);
 		if (shouldLogFcappKeepwarmFailure()) {
-			const message = error instanceof Error ? error.message : String(error);
-			console.warn(`[cc-switch] FC keepwarm failed: GET ${url} -> ${message}`);
+			console.warn(`[cc-switch] FC keepwarm failed: GET ${requestUrl} -> ${message}`);
 		}
 	} finally {
 		clearTimeout(timeout);
@@ -329,7 +385,7 @@ async function runFcappKeepwarm(url: string): Promise<void> {
 	}
 }
 
-function startFcappKeepwarmAfterSuccessfulRequest(requestUrl: string, label: string): void {
+function startFcappKeepwarm(requestUrl: string, label: string, apiKey?: string): void {
 	const keepwarmUrl = fcappKeepwarmEndpointFor(requestUrl);
 	if (!keepwarmUrl) return;
 	if (fcappKeepwarmTimer && fcappKeepwarmUrl === keepwarmUrl) return;
@@ -337,8 +393,10 @@ function startFcappKeepwarmAfterSuccessfulRequest(requestUrl: string, label: str
 	if (fcappKeepwarmTimer) clearInterval(fcappKeepwarmTimer);
 	fcappKeepwarmUrl = keepwarmUrl;
 	const intervalMs = fcappKeepwarmIntervalMs();
+	setFcappKeepwarmStatus(`FC保温: 运行中 ${fcappKeepwarmStatusPath(keepwarmUrl)} ${fcappKeepwarmStatusInterval(intervalMs)}`);
+	void runFcappKeepwarm(keepwarmUrl, apiKey, intervalMs);
 	fcappKeepwarmTimer = setInterval(() => {
-		void runFcappKeepwarm(keepwarmUrl);
+		void runFcappKeepwarm(keepwarmUrl, apiKey, intervalMs);
 	}, intervalMs);
 	(fcappKeepwarmTimer as { unref?: () => void }).unref?.();
 	console.info(`[cc-switch ${label}] FC keepwarm enabled: GET ${keepwarmUrl} every ${intervalMs}ms`);
@@ -769,6 +827,24 @@ function resolveRuntimeClaudeModel(model: Model<Api>, liveConfig?: ClaudeConfig)
 		contextWindow: claudeContextWindow(currentModel),
 		thinkingLevelMap: supportsOneMillionContext(currentModel) ? { xhigh: "xhigh" } : undefined,
 	};
+}
+
+function resolveRuntimeCodexModel(model: Model<Api>, liveConfig?: CodexConfig): Model<Api> {
+	if (!liveConfig || liveConfig.api !== "cc-switch-codex-responses") {
+		return model;
+	}
+	return {
+		...model,
+		id: liveConfig.model,
+		name: `cc-switch Codex (${liveConfig.model})`,
+		baseUrl: liveConfig.baseUrl,
+		input: TEXT_IMAGE_INPUT,
+		contextWindow: codexContextWindow(),
+	};
+}
+
+function resolveRuntimeCodexApiKey(options: SimpleStreamOptions | undefined, liveConfig?: CodexConfig): string | undefined {
+	return liveConfig?.api === "cc-switch-codex-responses" ? liveConfig.apiKey : options?.apiKey;
 }
 
 function resolveClaudeRequestModel(modelId: string): string {
@@ -1337,7 +1413,12 @@ function shapeForDebug(value: unknown, depth = 0): unknown {
 	return typeof value;
 }
 
-function writeDebugRequest(headers: Record<string, string>, payload: Record<string, unknown>, context?: Context): void {
+function writeDebugRequest(
+	headers: Record<string, string>,
+	payload: Record<string, unknown>,
+	context?: Context,
+	meta?: Record<string, unknown>,
+): void {
 	if (process.env.PI_CC_SWITCH_DEBUG !== "1") return;
 	const redactedHeaders: Record<string, string> = {};
 	for (const [key, value] of Object.entries(headers)) {
@@ -1346,6 +1427,7 @@ function writeDebugRequest(headers: Record<string, string>, payload: Record<stri
 	writeFileSync(
 		join(process.cwd(), "pi-cc-switch-debug-request.json"),
 		JSON.stringify({
+			...(meta ?? {}),
 			headers: redactedHeaders,
 			payload: shapeForDebug(payload),
 			contextTools: context?.tools?.map((tool) => tool.name) ?? [],
@@ -1993,12 +2075,14 @@ function streamCcSwitchCodexResponses(
 	const stream = createAssistantMessageEventStream();
 
 	(async () => {
+		const liveCodex = loadCodexConfig();
+		const runtimeModel = resolveRuntimeCodexModel(model, liveCodex);
 		const output: AssistantMessage = {
 			role: "assistant",
 			content: [],
-			api: model.api,
-			provider: model.provider,
-			model: model.id,
+			api: runtimeModel.api,
+			provider: runtimeModel.provider,
+			model: runtimeModel.id,
 			usage: {
 				input: 0,
 				output: 0,
@@ -2012,18 +2096,18 @@ function streamCcSwitchCodexResponses(
 		};
 
 		try {
-			const apiKey = options?.apiKey;
+			const apiKey = resolveRuntimeCodexApiKey(options, liveCodex);
 			if (!apiKey) throw new Error("Missing cc-switch Codex credential");
 
-			const payload = buildOpenAIResponsesPayload(model, context, options);
+			const payload = buildOpenAIResponsesPayload(runtimeModel, context, options);
 			const headers: Record<string, string> = {
 				accept: "text/event-stream",
 				"content-type": "application/json",
 				authorization: `Bearer ${apiKey}`,
 			};
-			writeDebugRequest(headers, payload, context);
 
-			const endpoint = endpointForOpenAIResponses(model.baseUrl);
+			const endpoint = endpointForOpenAIResponses(runtimeModel.baseUrl);
+			writeDebugRequest(headers, payload, context, { route: "primary", endpoint });
 			let response = await fetchWithFcappAdmissionRetry(endpoint, {
 				method: "POST",
 				headers,
@@ -2034,17 +2118,17 @@ function streamCcSwitchCodexResponses(
 			if (!response.ok) {
 				const errorText = await response.text();
 				const fallbackBaseUrl = isSummarizationContext(context) && /invalid_responses_request|invalid codex request/i.test(errorText)
-					? codexSummaryFallbackBaseUrl(model.baseUrl)
+					? codexSummaryFallbackBaseUrl(runtimeModel.baseUrl)
 					: undefined;
 				if (fallbackBaseUrl) {
 					const fallbackProvider = findCodexProviderInCcSwitchDb(fallbackBaseUrl);
-					const fallbackModelId = process.env[CODEX_SUMMARY_MODEL_ENV]?.trim() || fallbackProvider?.model || model.id;
-					const fallbackPayload = fallbackModelId === model.id ? payload : { ...payload, model: fallbackModelId };
+					const fallbackModelId = process.env[CODEX_SUMMARY_MODEL_ENV]?.trim() || fallbackProvider?.model || runtimeModel.id;
+					const fallbackPayload = fallbackModelId === runtimeModel.id ? payload : { ...payload, model: fallbackModelId };
 					const fallbackApiKey = process.env[CODEX_SUMMARY_API_KEY_ENV]?.trim() || fallbackProvider?.apiKey || apiKey;
 					const fallbackHeaders = { ...headers, authorization: `Bearer ${fallbackApiKey}` };
 					const fallbackEndpoint = endpointForOpenAIResponses(fallbackBaseUrl);
 					console.warn(`[cc-switch Codex] compact summary fallback: ${endpoint} -> ${fallbackEndpoint}`);
-					writeDebugRequest(fallbackHeaders, fallbackPayload, context);
+					writeDebugRequest(fallbackHeaders, fallbackPayload, context, { route: "summary-fallback", endpoint: fallbackEndpoint, primaryEndpoint: endpoint });
 					response = await fetchWithFcappAdmissionRetry(fallbackEndpoint, {
 						method: "POST",
 						headers: fallbackHeaders,
@@ -2061,10 +2145,10 @@ function streamCcSwitchCodexResponses(
 			if (!response.body) {
 				throw new Error("cc-switch Codex response did not include a stream body");
 			}
-			startFcappKeepwarmAfterSuccessfulRequest(endpoint, "Codex");
+			startFcappKeepwarm(endpoint, "Codex", apiKey);
 
 			stream.push({ type: "start", partial: output });
-			await processOpenAIResponsesSse(response, output, stream, model);
+			await processOpenAIResponsesSse(response, output, stream, runtimeModel);
 			if (options?.signal?.aborted) throw new Error("Request was aborted");
 			stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
 			stream.end();
@@ -2072,8 +2156,8 @@ function streamCcSwitchCodexResponses(
 			// 记录详细的错误日志，方便调试
 			const errorDetails = {
 				provider: 'cc-switch-codex',
-				model: model.id,
-				api: model.api,
+				model: runtimeModel.id,
+				api: runtimeModel.api,
 				error: error instanceof Error ? {
 					message: error.message,
 					stack: error.stack,
@@ -2177,7 +2261,7 @@ function streamCcSwitchAnthropic(
 			if (!response.body) {
 				throw new Error("cc-switch Claude response did not include a stream body");
 			}
-			startFcappKeepwarmAfterSuccessfulRequest(endpoint, "Claude");
+			startFcappKeepwarm(endpoint, "Claude", apiKey);
 
 			stream.push({ type: "start", partial: output });
 			const reader = response.body.getReader();
@@ -2279,6 +2363,9 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	const codex = loadCodexConfig();
+	if (codex?.api === "cc-switch-codex-responses") {
+		startFcappKeepwarm(endpointForOpenAIResponses(codex.baseUrl), "Codex", codex.apiKey);
+	}
 	if (codex) {
 		pi.registerProvider("cc-switch-codex", {
 			name: "cc-switch Codex",
@@ -2306,16 +2393,23 @@ export default function (pi: ExtensionAPI) {
 		description: "Show cc-switch provider import status",
 		handler: (_args, ctx) => {
 			const liveClaude = loadClaudeConfig() ?? claude;
+			const liveCodex = loadCodexConfig() ?? codex;
 			const lines = [
 				liveClaude
 					? `Claude: current=${liveClaude.currentModel ?? "unknown"}; models=${liveClaude.models.map((model) => `cc-switch-claude/${model}`).join(", ")} -> ${liveClaude.baseUrl}`
 					: loadDiagnostics.claude ?? "Claude: no ~/.claude/settings.json provider found",
-				codex
-					? `Codex: cc-switch-codex/${codex.model} -> ${codex.baseUrl}`
+				liveCodex
+					? `Codex: cc-switch-codex/${liveCodex.model} -> ${liveCodex.baseUrl}`
 					: loadDiagnostics.codex ?? "Codex: no ~/.codex provider found",
+				fcappKeepwarmStatusLine(),
 			];
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
+	});
+
+	pi.on("session_start", (_event, ctx) => {
+		fcappKeepwarmStatusSink = (text) => ctx.ui.setStatus(FCAPP_KEEPWARM_STATUS_KEY, text);
+		fcappKeepwarmStatusSink(fcappKeepwarmStatusText);
 	});
 
 	pi.on("tool_execution_start", (event, ctx) => {
