@@ -97,13 +97,19 @@ const FCAPP_KEEPWARM_SESSION_ID = "cc-switch-fcapp-keepwarm";
 const FCAPP_KEEPWARM_TIMEOUT_MS = 15000;
 const FCAPP_KEEPWARM_FAILURE_LOG_INTERVAL_MS = 600000;
 const FCAPP_KEEPWARM_STATUS_KEY = "cc-switch-fcapp-keepwarm";
+const FCAPP_KEEPWARM_CIRCUIT_BREAKER_STATUSES = new Set([401, 403, 429]);
 
 // 只对指定 FC 中转站做入场重试：请求拿到可读 SSE 响应后，流中途错误仍交给 Pi 会话级重试处理。
 // 这样可以无限等待入口名额，同时避免半条 assistant 消息或工具调用被 provider 内部重放。
 
-// FC keepwarm 默认永久开启：扩展加载到 fcapp 配置后立即走一次真实 Responses 请求，随后每分钟用轻量 hi 提问维活。
-// 初始状态可用 PI_CC_SWITCH_FCAPP_KEEPWARM=0/false/no/off 关闭；运行期可用 /fc 随时切换。
+// FC keepwarm 默认永久开启：加载到 fcapp 配置后立即走一次真实 Responses 请求；空闲时每分钟用轻量 hi 维活，真实请求会重置计时。
+// 初始状态可用 PI_CC_SWITCH_FCAPP_KEEPWARM=0/false/no/off 关闭；运行期可用 /fc 随时切换，风控状态码会自动熔断。
 type FcappKeepwarmMode = "responses" | "models";
+
+interface FcappAdmissionRetryOptions {
+	retryRateLimit?: boolean;
+}
+
 let fcappKeepwarmTimer: ReturnType<typeof setTimeout> | undefined;
 let fcappKeepwarmUrl: string | undefined;
 let fcappKeepwarmModeState: FcappKeepwarmMode | undefined;
@@ -255,7 +261,12 @@ async function safeResponseText(response: Response): Promise<string> {
 	}
 }
 
-async function fetchWithFcappAdmissionRetry(url: string, init: RequestInit, label: string): Promise<Response> {
+async function fetchWithFcappAdmissionRetry(
+	url: string,
+	init: RequestInit,
+	label: string,
+	options: FcappAdmissionRetryOptions = {},
+): Promise<Response> {
 	if (!isFcappAdmissionRetryEndpoint(url)) {
 		return fetch(url, init);
 	}
@@ -266,6 +277,8 @@ async function fetchWithFcappAdmissionRetry(url: string, init: RequestInit, labe
 
 		try {
 			const response = await fetch(url, init);
+			// 保温流量遇到限流时直接交给熔断器，避免沿用业务请求的秒级入场重试产生突发流量。
+			if (response.status === 429 && options.retryRateLimit === false) return response;
 			if (!FCAPP_ADMISSION_RETRY_STATUSES.has(response.status)) return response;
 
 			const body = await safeResponseText(response);
@@ -451,6 +464,18 @@ function fcappKeepwarmStatusLine(): string {
 	return fcappKeepwarmStatusText ?? `FC保温: ${fcappKeepwarmEnabled() ? "等待 fcapp 配置" : "已关闭"}`;
 }
 
+function tripFcappKeepwarmCircuit(status: number): void {
+	fcappKeepwarmRuntimeEnabled = false;
+	if (fcappKeepwarmTimer) {
+		clearTimeout(fcappKeepwarmTimer);
+		fcappKeepwarmTimer = undefined;
+	}
+	fcappKeepwarmGeneration += 1;
+	fcappKeepwarmAbortController?.abort();
+	const lastSuccess = fcappKeepwarmLastSuccessStatusText?.replace(/^FC保温:\s*/, "");
+	setFcappKeepwarmStatus(`FC保温: 已熔断 HTTP ${status}${lastSuccess ? `；${lastSuccess}` : ""}`);
+}
+
 function fcappKeepwarmRunActive(generation?: number): boolean {
 	return fcappKeepwarmEnabled() && (generation === undefined || generation === fcappKeepwarmGeneration);
 }
@@ -491,7 +516,7 @@ async function runFcappKeepwarm(
 				headers,
 				body: JSON.stringify(buildFcappKeepwarmResponsesPayload(modelId as string)),
 				signal: controller.signal,
-			}, "Codex keepwarm");
+			}, "Codex keepwarm", { retryRateLimit: false });
 		} else {
 			response = await fetch(requestUrl, {
 				method: "GET",
@@ -504,6 +529,12 @@ async function runFcappKeepwarm(
 		if (!response.ok) {
 			const body = await safeResponseText(response);
 			if (!fcappKeepwarmRunActive(generation)) return;
+			if (FCAPP_KEEPWARM_CIRCUIT_BREAKER_STATUSES.has(response.status)) {
+				// 鉴权失败、禁止访问或限流时立即停止自动流量，等待用户通过 /fc on 明确恢复。
+				tripFcappKeepwarmCircuit(response.status);
+				console.warn(`[cc-switch] FC keepwarm circuit opened: ${mode === "responses" ? "POST" : "GET"} ${requestUrl} -> HTTP ${response.status} ${body}`);
+				return;
+			}
 			const detail = compactLogText(body);
 			setFcappKeepwarmStatus(`FC保温: 失败 HTTP ${response.status}${detail ? ` ${detail}` : ""} #${fcappKeepwarmSuccessCount}/${attempt} ${target}`);
 			if (shouldLogFcappKeepwarmFailure()) {
@@ -531,7 +562,13 @@ async function runFcappKeepwarm(
 	}
 }
 
-function startFcappKeepwarm(requestUrl: string, label: string, apiKey?: string, modelId?: string): boolean {
+function startFcappKeepwarm(
+	requestUrl: string,
+	label: string,
+	apiKey?: string,
+	modelId?: string,
+	deferAfterRealRequest = false,
+): boolean {
 	const mode = fcappKeepwarmMode();
 	if (mode === "responses" && !modelId) return false;
 	const keepwarmUrl = fcappKeepwarmEndpointFromRequest(requestUrl, mode);
@@ -544,19 +581,22 @@ function startFcappKeepwarm(requestUrl: string, label: string, apiKey?: string, 
 	fcappKeepwarmLastModel = modelId;
 
 	if (!fcappKeepwarmEnabled()) return false;
-	if (
-		fcappKeepwarmTimer &&
+	const sameConfig =
 		fcappKeepwarmUrl === keepwarmUrl &&
 		fcappKeepwarmModeState === mode &&
 		fcappKeepwarmModel === modelId &&
-		fcappKeepwarmApiKey === apiKey
-	) return true;
+		fcappKeepwarmApiKey === apiKey;
+	if (fcappKeepwarmTimer && sameConfig && !deferAfterRealRequest) return true;
 
 	if (fcappKeepwarmTimer) {
 		clearTimeout(fcappKeepwarmTimer);
 		fcappKeepwarmTimer = undefined;
 	}
 	const generation = ++fcappKeepwarmGeneration;
+	if (deferAfterRealRequest) {
+		// 已有保温请求尚未结束时，以真实业务请求为准，立即取消多余的自动流量。
+		fcappKeepwarmAbortController?.abort();
+	}
 	fcappKeepwarmUrl = keepwarmUrl;
 	fcappKeepwarmModeState = mode;
 	fcappKeepwarmModel = modelId;
@@ -573,8 +613,17 @@ function startFcappKeepwarm(requestUrl: string, label: string, apiKey?: string, 
 		}, delayMs);
 		(fcappKeepwarmTimer as { unref?: () => void }).unref?.();
 	};
-	void runFcappKeepwarm(keepwarmUrl, apiKey, intervalMs, mode, modelId, generation).finally(scheduleNext);
-	console.info(`[cc-switch ${label}] FC keepwarm enabled: ${target} every ${intervalMs}ms ±${Math.round(fcappKeepwarmJitterRatio() * 100)}%`);
+	if (deferAfterRealRequest) {
+		// 真实模型请求本身已经完成续温，从此刻重新计时，避免业务活跃期间额外发送 hi。
+		setFcappKeepwarmStatus(`FC保温: 真实请求已续温 ${target} ${fcappKeepwarmStatusInterval(intervalMs)}`);
+		scheduleNext();
+		if (process.env.PI_CC_SWITCH_DEBUG === "1") {
+			console.info(`[cc-switch ${label}] FC keepwarm deferred after real request: ${target}`);
+		}
+	} else {
+		void runFcappKeepwarm(keepwarmUrl, apiKey, intervalMs, mode, modelId, generation).finally(scheduleNext);
+		console.info(`[cc-switch ${label}] FC keepwarm enabled: ${target} every ${intervalMs}ms ±${Math.round(fcappKeepwarmJitterRatio() * 100)}%`);
+	}
 	return true;
 }
 
@@ -2362,7 +2411,7 @@ function streamCcSwitchCodexResponses(
 			if (!response.body) {
 				throw new Error("cc-switch Codex response did not include a stream body");
 			}
-			startFcappKeepwarm(endpoint, "Codex", apiKey, runtimeModel.id);
+			startFcappKeepwarm(endpoint, "Codex", apiKey, runtimeModel.id, true);
 
 			stream.push({ type: "start", partial: output });
 			await processOpenAIResponsesSse(response, output, stream, runtimeModel);
@@ -2478,7 +2527,7 @@ function streamCcSwitchAnthropic(
 			if (!response.body) {
 				throw new Error("cc-switch Claude response did not include a stream body");
 			}
-			startFcappKeepwarm(endpoint, "Claude", apiKey);
+			startFcappKeepwarm(endpoint, "Claude", apiKey, undefined, true);
 
 			stream.push({ type: "start", partial: output });
 			const reader = response.body.getReader();
