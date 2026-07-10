@@ -36,7 +36,7 @@ pi install git:github.com/Ginkgoooo/pi-cc-switch-provider
 |---|---|
 | `pi --list-models cc-switch` | List all models registered by this extension. |
 | `pi` | Start Pi directly. After startup, use `/model` to select a cc-switch model. |
-| `pi --provider cc-switch-codex --model gpt-5.5` | Start Pi with the Codex provider imported from cc-switch. Replace the model with the one shown by `pi --list-models cc-switch` if needed. |
+| `pi --provider cc-switch-codex --model current` | Start Pi with the Codex provider and follow the current model selected in cc-switch. |
 | `pi --provider cc-switch-claude --model current` | Start Pi with the Claude provider and follow the current model selected in cc-switch. |
 | `pi --provider cc-switch-claude --model mimo-v2.5-pro` | Start Pi with a concrete Claude model imported from cc-switch. Replace it with the one shown by `pi --list-models cc-switch`. |
 | `/cc-switch` | Show the import status of cc-switch Codex and Claude providers inside Pi. |
@@ -47,7 +47,7 @@ Examples:
 ```powershell
 pi --list-models cc-switch
 pi
-pi --provider cc-switch-codex --model gpt-5.5
+pi --provider cc-switch-codex --model current
 pi --provider cc-switch-claude --model current
 pi --provider cc-switch-claude --model mimo-v2.5-pro
 ```
@@ -201,7 +201,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 | Shortcut | Expands to | Purpose |
 |---|---|---|
 | `pi-models` | `pi --list-models cc-switch` | List cc-switch models quickly. |
-| `pi-codex` | `pi --provider cc-switch-codex --model gpt-5.5` | Start Pi with the cc-switch Codex provider quickly. |
+| `pi-codex` | `pi --provider cc-switch-codex --model current` | Start Pi with the cc-switch Codex provider quickly. |
 | `pi-claude` | `pi --provider cc-switch-claude --model claude-sonnet-4-5` | Start Pi with the cc-switch Claude provider quickly. |
 
 ### Claude Models
@@ -209,6 +209,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 The extension registers `cc-switch-claude/current`, which re-reads `%USERPROFILE%\.claude\settings.json` before each request and follows the current model selected in cc-switch. It also registers the concrete model currently written by cc-switch, such as `mimo-v2.5-pro`.
 
 To add extra fixed models, set `PI_CC_SWITCH_CLAUDE_MODELS` in cc-switch's Claude env config as a comma- or space-separated list.
+
+### Codex Models
+
+The extension registers `cc-switch-codex/current`, which re-reads `%USERPROFILE%\.codex\config.toml` before each request and follows the current model selected in cc-switch. It also registers the concrete current model plus fixed entries for `gpt-5.5` and `gpt-5.6-sol`.
 
 ### Claude Tools
 
@@ -222,7 +226,7 @@ Set `PI_CC_SWITCH_CODEX_CONTEXT_WINDOW` to override the value, for example:
 
 ```powershell
 $env:PI_CC_SWITCH_CODEX_CONTEXT_WINDOW = "256000"
-pi --provider cc-switch-codex --model gpt-5.5
+pi --provider cc-switch-codex --model current
 ```
 
 Pi compaction and branch-summary requests are sent to Codex without reasoning, even when the active chat uses a high thinking level. This keeps overflow recovery text-only and avoids `invalid_responses_request` errors from Responses-compatible cc-switch proxies.
@@ -269,7 +273,7 @@ pi install git:github.com/Ginkgoooo/pi-cc-switch-provider
 |---|---|
 | `pi --list-models cc-switch` | 列出本扩展注册的所有 cc-switch 模型。 |
 | `pi` | 直接启动 Pi。启动后可在 Pi 内使用 `/model` 选择 cc-switch 模型。 |
-| `pi --provider cc-switch-codex --model gpt-5.5` | 使用 cc-switch 导入的 Codex provider 启动 Pi。如实际模型不同，可替换为 `pi --list-models cc-switch` 显示的模型。 |
+| `pi --provider cc-switch-codex --model current` | 使用 cc-switch 导入的 Codex provider，并跟随 cc-switch 当前选择的模型。 |
 | `pi --provider cc-switch-claude --model current` | 使用 cc-switch 导入的 Claude provider，并跟随 cc-switch 当前选择的模型。 |
 | `pi --provider cc-switch-claude --model mimo-v2.5-pro` | 使用 cc-switch 导入的 Claude provider 和具体模型启动 Pi。可替换为 `pi --list-models cc-switch` 显示的模型。 |
 | `/cc-switch` | 在 Pi 内查看 cc-switch Codex 和 Claude provider 的导入状态。 |
@@ -280,7 +284,7 @@ pi install git:github.com/Ginkgoooo/pi-cc-switch-provider
 ```powershell
 pi --list-models cc-switch
 pi
-pi --provider cc-switch-codex --model gpt-5.5
+pi --provider cc-switch-codex --model current
 pi --provider cc-switch-claude --model current
 pi --provider cc-switch-claude --model mimo-v2.5-pro
 ```
@@ -434,7 +438,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 | 快捷命令 | 展开后等价于 | 作用 |
 |---|---|---|
 | `pi-models` | `pi --list-models cc-switch` | 快速列出 cc-switch 模型。 |
-| `pi-codex` | `pi --provider cc-switch-codex --model gpt-5.5` | 快速使用 cc-switch Codex provider 启动 Pi。 |
+| `pi-codex` | `pi --provider cc-switch-codex --model current` | 快速使用 cc-switch Codex provider 启动 Pi。 |
 | `pi-claude` | `pi --provider cc-switch-claude --model claude-sonnet-4-5` | 快速使用 cc-switch Claude provider 启动 Pi。 |
 
 ### Claude 模型
@@ -447,6 +451,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 
 `cc-switch-claude` 会用 `Bash`、`Read`、`Edit`、`MultiEdit`、`Write`、`LS`、`Grep`、`Glob` 等 Claude Code 兼容工具名向 Claude 暴露 Pi 工具。工具执行仍由 Pi 内置工具完成，本包不会启动 Claude Code 子进程。
 
+### Codex 模型
+
+该扩展会注册 `cc-switch-codex/current`，并在每次请求前重新读取 `%USERPROFILE%\.codex\config.toml`，跟随 cc-switch 当前选择的模型。同时会注册当前具体模型，并固定额外注册 `gpt-5.5` 和 `gpt-5.6-sol`。
+
 ### Codex 上下文与压缩
 
 `cc-switch-codex` 默认使用保守的 200,000 token 上下文窗口。即使 Codex 模型展示了更大的缓存上下文，这也能让 Pi 在上游 cc-switch Codex 通道返回 `context_length_exceeded` 前提前压缩。
@@ -455,7 +463,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 
 ```powershell
 $env:PI_CC_SWITCH_CODEX_CONTEXT_WINDOW = "256000"
-pi --provider cc-switch-codex --model gpt-5.5
+pi --provider cc-switch-codex --model current
 ```
 
 Pi 的上下文压缩和分支摘要请求会以无 reasoning 的纯文本请求发给 Codex，即使当前聊天使用 high thinking。这样可以降低 Responses 兼容 cc-switch 中转在溢出恢复时返回 `invalid_responses_request` 的概率。

@@ -64,6 +64,8 @@ const CODEX_SUMMARY_BASE_URL_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_BASE_URL";
 const DEFAULT_CODEX_SUMMARY_BASE_URL = "https://paid.tribiosapi.top/v1";
 const CODEX_SUMMARY_MODEL_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_MODEL";
 const CODEX_SUMMARY_API_KEY_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_API_KEY";
+const CURRENT_CODEX_MODEL_ID = "current";
+const DEFAULT_CODEX_MODELS = ["gpt-5.5", "gpt-5.6-sol"] as const;
 const CURRENT_CLAUDE_MODEL_ID = "current";
 const DEFAULT_CLAUDE_OPUS_MODEL = "claude-opus-4-8";
 const DEFAULT_CLAUDE_SONNET_MODEL = "claude-sonnet-4-6";
@@ -1018,6 +1020,10 @@ function isCurrentClaudeModel(modelId: string): boolean {
 	return modelId === CURRENT_CLAUDE_MODEL_ID;
 }
 
+function isCurrentCodexModel(modelId: string): boolean {
+	return modelId === CURRENT_CODEX_MODEL_ID;
+}
+
 function resolveRuntimeClaudeModel(model: Model<Api>, liveConfig?: ClaudeConfig): Model<Api> {
 	if (!isCurrentClaudeModel(model.id)) {
 		return model;
@@ -1048,6 +1054,10 @@ function resolveRuntimeCodexModel(model: Model<Api>, liveConfig?: CodexConfig): 
 		input: TEXT_IMAGE_INPUT,
 		contextWindow: codexContextWindow(),
 	};
+}
+
+function codexModels(currentModel: string): string[] {
+	return Array.from(new Set([CURRENT_CODEX_MODEL_ID, currentModel, ...DEFAULT_CODEX_MODELS]));
 }
 
 function resolveRuntimeCodexApiKey(options: SimpleStreamOptions | undefined, liveConfig?: CodexConfig): string | undefined {
@@ -2579,17 +2589,20 @@ export default function (pi: ExtensionAPI) {
 			baseUrl: codex.baseUrl,
 			apiKey: codex.apiKey,
 			api: codex.api as Api,
-			models: [
-				{
-					id: codex.model,
-					name: `cc-switch Codex (${codex.model})`,
+			models: codexModels(codex.model).map((model) => {
+				const displayModel = isCurrentCodexModel(model) ? codex.model : model;
+				return {
+					id: model,
+					name: isCurrentCodexModel(model)
+						? `cc-switch Codex (current: ${displayModel})`
+						: `cc-switch Codex (${model})`,
 					reasoning: true,
 					input: codex.api === "cc-switch-codex-responses" ? TEXT_IMAGE_INPUT : TEXT_INPUT,
 					cost: ZERO_COST,
 					contextWindow: codexContextWindow(),
 					maxTokens: 64000,
-				},
-			],
+				};
+			}),
 			...(codex.api === "cc-switch-codex-responses"
 				? { streamSimple: (model, context, options) => streamCcSwitchCodexResponses(model, context, options) }
 				: {}),
