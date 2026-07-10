@@ -476,5 +476,3 @@ Pi 的上下文压缩和分支摘要请求会以无 reasoning 的纯文本请求
 - `%USERPROFILE%\.codex\auth.json`
 - `%USERPROFILE%\.codex\config.toml`
 
-### 友情链接
-https://linux.do/
