@@ -39,6 +39,7 @@ interface CodexConfig {
 	apiKey: string;
 	api: "cc-switch-codex-responses" | "openai-completions";
 	model: string;
+	modelReasoningEffort?: string;
 }
 
 interface SseEvent {
@@ -66,6 +67,7 @@ const CODEX_SUMMARY_MODEL_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_MODEL";
 const CODEX_SUMMARY_API_KEY_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_API_KEY";
 const CURRENT_CODEX_MODEL_ID = "current";
 const DEFAULT_CODEX_MODELS = ["gpt-5.5", "gpt-5.6-sol"] as const;
+const CODEX_CONFIG_REASONING_MODEL = "gpt-5.6-sol";
 const CURRENT_CLAUDE_MODEL_ID = "current";
 const DEFAULT_CLAUDE_OPUS_MODEL = "claude-opus-4-8";
 const DEFAULT_CLAUDE_SONNET_MODEL = "claude-sonnet-4-6";
@@ -797,6 +799,7 @@ function extractCodexFromConfigText(apiKey: string, configText: string): Extract
 			apiKey,
 			api: wireApi === "chat" ? "openai-completions" : "cc-switch-codex-responses",
 			model,
+			modelReasoningEffort: toml.top.model_reasoning_effort,
 		},
 	};
 }
@@ -2036,6 +2039,7 @@ function buildOpenAIResponsesPayload(
 	model: Model<Api>,
 	context: Context,
 	options?: SimpleStreamOptions,
+	modelReasoningEffort?: string,
 ): Record<string, unknown> {
 	const summarizationContext = isSummarizationContext(context);
 	const summarizationInstructions = "You are Codex, a coding agent. Produce only the requested structured context summary.";
@@ -2084,10 +2088,16 @@ function buildOpenAIResponsesPayload(
 	// even when the active chat uses reasoning, otherwise some cc-switch Codex
 	// Responses proxies reject the summarization payload as invalid_responses_request.
 	if (model.reasoning && !summarizationContext) {
+		// gpt-5.6-sol 使用 Codex 配置中的原始档位（例如 ultra），不受 Pi 内置档位枚举限制。
+		// 摘要请求仍走既有恢复策略，避免高强度 reasoning 影响 compact 成功率。
+		const configuredEffort = model.id === CODEX_CONFIG_REASONING_MODEL ? modelReasoningEffort : undefined;
 		const reasoning = options?.reasoning;
-		if (reasoning && reasoning !== "off") {
+		const selectedEffort = configuredEffort ?? (reasoning && reasoning !== "off"
+			? (model.thinkingLevelMap?.[reasoning] ?? reasoning)
+			: undefined);
+		if (selectedEffort) {
 			payload.reasoning = {
-				effort: model.thinkingLevelMap?.[reasoning] ?? reasoning,
+				effort: selectedEffort,
 				summary: "auto",
 			};
 			payload.include = ["reasoning.encrypted_content"];
@@ -2365,7 +2375,7 @@ function streamCcSwitchCodexResponses(
 			const apiKey = resolveRuntimeCodexApiKey(options, liveCodex);
 			if (!apiKey) throw new Error("Missing cc-switch Codex credential");
 
-			const payload = buildOpenAIResponsesPayload(runtimeModel, context, options);
+			const payload = buildOpenAIResponsesPayload(runtimeModel, context, options, liveCodex?.modelReasoningEffort);
 			const headers: Record<string, string> = {
 				accept: "text/event-stream",
 				"content-type": "application/json",
