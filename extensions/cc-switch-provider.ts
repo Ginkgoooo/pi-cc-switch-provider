@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, unwatchFile, watchFile, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 import {
 	type Api,
@@ -905,6 +906,195 @@ function parseCodexTomlScalar(raw: string): string | undefined {
 	}
 	// 裸值：true/false/number，按原文返回即可。
 	return raw;
+}
+
+interface CodexFooterConfig {
+	api?: CodexConfig["api"];
+	model?: string;
+	modelReasoningEffort?: string;
+}
+
+function readCodexFooterConfig(configPath: string): CodexFooterConfig {
+	if (!existsSync(configPath)) return {};
+	try {
+		const toml = parseCodexConfigToml(readFileSync(configPath, "utf8"));
+		const activeProviderId = toml.top.model_provider;
+		const section = activeProviderId
+			? toml.sections[`model_providers.${activeProviderId}`]
+			: undefined;
+		const wireApi = section?.wire_api ?? toml.top.wire_api;
+		return {
+			api: wireApi === "chat" ? "openai-completions" : "cc-switch-codex-responses",
+			model: stringValue(toml.top.model),
+			modelReasoningEffort: stringValue(toml.top.model_reasoning_effort),
+		};
+	} catch {
+		return {};
+	}
+}
+
+function sameCodexFooterConfig(left: CodexFooterConfig, right: CodexFooterConfig): boolean {
+	return left.api === right.api &&
+		left.model === right.model &&
+		left.modelReasoningEffort === right.modelReasoningEffort;
+}
+
+function formatFooterTokens(count: number): string {
+	if (count < 1000) return count.toString();
+	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
+	if (count < 1000000) return `${Math.round(count / 1000)}k`;
+	if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
+	return `${Math.round(count / 1000000)}M`;
+}
+
+function formatFooterCwd(cwd: string, home: string | undefined): string {
+	if (!home) return cwd;
+	const resolvedCwd = resolve(cwd);
+	const resolvedHome = resolve(home);
+	const relativeToHome = relative(resolvedHome, resolvedCwd);
+	const isInsideHome = relativeToHome === "" ||
+		(relativeToHome !== ".." && !relativeToHome.startsWith(`..${sep}`) && !isAbsolute(relativeToHome));
+	if (!isInsideHome) return cwd;
+	return relativeToHome === "" ? "~" : `~${sep}${relativeToHome}`;
+}
+
+function sanitizeFooterStatusText(text: string): string {
+	return text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim();
+}
+
+/**
+ * 接管 Pi 页脚中的模型思考档位展示。
+ *
+ * Pi 内置页脚固定显示 session thinkingLevel，无法反映 gpt-5.6-sol 最终直传的
+ * model_reasoning_effort。这里保留原页脚信息，只把 Codex 模型和档位替换为实际请求值。
+ */
+function installCcSwitchFooter(pi: ExtensionAPI, ctx: ExtensionContext): void {
+	if (!ctx.hasUI) return;
+	const configPath = join(homedir(), ".codex", "config.toml");
+
+	ctx.ui.setFooter((tui, theme, footerData) => {
+		let codexConfig = readCodexFooterConfig(configPath);
+		const onConfigChange = () => {
+			const nextConfig = readCodexFooterConfig(configPath);
+			if (sameCodexFooterConfig(codexConfig, nextConfig)) return;
+			codexConfig = nextConfig;
+			tui.requestRender();
+		};
+		watchFile(configPath, { interval: 500 }, onConfigChange);
+		const unsubscribeBranch = footerData.onBranchChange(() => tui.requestRender());
+
+		return {
+			dispose(): void {
+				unsubscribeBranch();
+				unwatchFile(configPath, onConfigChange);
+			},
+			invalidate(): void {},
+			render(width: number): string[] {
+				let totalInput = 0;
+				let totalOutput = 0;
+				let totalCacheRead = 0;
+				let totalCacheWrite = 0;
+				let totalCost = 0;
+				for (const entry of ctx.sessionManager.getEntries()) {
+					if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+					totalInput += entry.message.usage.input;
+					totalOutput += entry.message.usage.output;
+					totalCacheRead += entry.message.usage.cacheRead;
+					totalCacheWrite += entry.message.usage.cacheWrite;
+					totalCost += entry.message.usage.cost.total;
+				}
+
+				const contextUsage = ctx.getContextUsage();
+				const contextWindow = contextUsage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
+				const contextPercentValue = contextUsage?.percent ?? 0;
+				const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
+				const contextDisplay = contextPercent === "?"
+					? `?/${formatFooterTokens(contextWindow)}`
+					: `${contextPercent}%/${formatFooterTokens(contextWindow)}`;
+				const contextText = contextPercentValue > 90
+					? theme.fg("error", contextDisplay)
+					: contextPercentValue > 70
+						? theme.fg("warning", contextDisplay)
+						: contextDisplay;
+
+				let pwd = formatFooterCwd(ctx.sessionManager.getCwd(), process.env.HOME || process.env.USERPROFILE);
+				const branch = footerData.getGitBranch();
+				if (branch) pwd = `${pwd} (${branch})`;
+				const sessionName = ctx.sessionManager.getSessionName();
+				if (sessionName) pwd = `${pwd} • ${sessionName}`;
+
+				const statsParts: string[] = [];
+				if (totalInput) statsParts.push(`↑${formatFooterTokens(totalInput)}`);
+				if (totalOutput) statsParts.push(`↓${formatFooterTokens(totalOutput)}`);
+				if (totalCacheRead) statsParts.push(`R${formatFooterTokens(totalCacheRead)}`);
+				if (totalCacheWrite) statsParts.push(`W${formatFooterTokens(totalCacheWrite)}`);
+				const usingSubscription = ctx.model ? ctx.modelRegistry.isUsingOAuth(ctx.model) : false;
+				if (totalCost || usingSubscription) {
+					statsParts.push(`$${totalCost.toFixed(3)}${usingSubscription ? " (sub)" : ""}`);
+				}
+				statsParts.push(contextText);
+				let statsLeft = statsParts.join(" ");
+				let statsLeftWidth = visibleWidth(statsLeft);
+				if (statsLeftWidth > width) {
+					statsLeft = truncateToWidth(statsLeft, width, "...");
+					statsLeftWidth = visibleWidth(statsLeft);
+				}
+
+				const model = ctx.model;
+				const followsLiveCodex = model?.provider === "cc-switch-codex" &&
+					codexConfig.api === "cc-switch-codex-responses" && Boolean(codexConfig.model);
+				const modelName = followsLiveCodex ? (codexConfig.model as string) : (model?.id ?? "no-model");
+				let rightSideWithoutProvider = modelName;
+				if (model?.reasoning) {
+					const configuredEffort = followsLiveCodex && modelName === CODEX_CONFIG_REASONING_MODEL
+						? codexConfig.modelReasoningEffort
+						: undefined;
+					const thinkingLevel = pi.getThinkingLevel() || "off";
+					const displayedEffort = configuredEffort ?? thinkingLevel;
+					rightSideWithoutProvider = !configuredEffort && displayedEffort === "off"
+						? `${modelName} • thinking off`
+						: `${modelName} • ${displayedEffort}`;
+				}
+
+				let rightSide = rightSideWithoutProvider;
+				const minPadding = 2;
+				if (footerData.getAvailableProviderCount() > 1 && model) {
+					rightSide = `(${model.provider}) ${rightSideWithoutProvider}`;
+					if (statsLeftWidth + minPadding + visibleWidth(rightSide) > width) {
+						rightSide = rightSideWithoutProvider;
+					}
+				}
+
+				const rightSideWidth = visibleWidth(rightSide);
+				const availableForRight = width - statsLeftWidth - minPadding;
+				let statsLine: string;
+				if (statsLeftWidth + minPadding + rightSideWidth <= width) {
+					statsLine = statsLeft + " ".repeat(width - statsLeftWidth - rightSideWidth) + rightSide;
+				} else if (availableForRight > 0) {
+					const truncatedRight = truncateToWidth(rightSide, availableForRight, "");
+					statsLine = statsLeft + " ".repeat(Math.max(0, width - statsLeftWidth - visibleWidth(truncatedRight))) + truncatedRight;
+				} else {
+					statsLine = statsLeft;
+				}
+
+				const dimStatsLeft = theme.fg("dim", statsLeft);
+				const dimRemainder = theme.fg("dim", statsLine.slice(statsLeft.length));
+				const lines = [
+					truncateToWidth(theme.fg("dim", pwd), width, theme.fg("dim", "...")),
+					dimStatsLeft + dimRemainder,
+				];
+				const extensionStatuses = footerData.getExtensionStatuses();
+				if (extensionStatuses.size > 0) {
+					const statusLine = Array.from(extensionStatuses.entries())
+						.sort(([left], [right]) => left.localeCompare(right))
+						.map(([, text]) => sanitizeFooterStatusText(text))
+						.join(" ");
+					lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "...")));
+				}
+				return lines;
+			},
+		};
+	});
 }
 
 function extractCodexBaseUrlFromConfigText(configText: string): string | undefined {
@@ -2719,6 +2909,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", (_event, ctx) => {
+		installCcSwitchFooter(pi, ctx);
 		fcappKeepwarmStatusSink = (text) => ctx.ui.setStatus(FCAPP_KEEPWARM_STATUS_KEY, text);
 		fcappKeepwarmStatusSink(fcappKeepwarmStatusText);
 	});
