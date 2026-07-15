@@ -81,6 +81,7 @@ const CLAUDE_CODE_BETAS = [
 	"effort-2025-11-24",
 ];
 const FCAPP_ADMISSION_RETRY_HOST = "a-ocnfniawgw.cn-shanghai.fcapp.run";
+const FCAPP_KEEPWARM_FALLBACK_BASE_URL = "https://anyrouter.top";
 const FCAPP_ADMISSION_RETRY_BASE_DELAY_MS = 1000;
 const FCAPP_ADMISSION_RETRY_MAX_DELAY_MS = 15000;
 const FCAPP_ADMISSION_RETRY_STATUSES = new Set([408, 429, 499, 500, 502, 503, 504]);
@@ -106,11 +107,19 @@ const FCAPP_KEEPWARM_CIRCUIT_BREAKER_STATUSES = new Set([401, 403, 429]);
 // 这样可以无限等待入口名额，同时避免半条 assistant 消息或工具调用被 provider 内部重放。
 
 // FC keepwarm 默认永久开启：加载到 fcapp 配置后立即走一次真实 Responses 请求；空闲时每分钟用轻量 hi 维活，真实请求会重置计时。
-// 初始状态可用 PI_CC_SWITCH_FCAPP_KEEPWARM=0/false/no/off 关闭；运行期可用 /fc 随时切换，风控状态码会自动熔断。
+// 主 FC 不可用时按顺序尝试 anyrouter.top；初始状态可用 PI_CC_SWITCH_FCAPP_KEEPWARM=0/false/no/off 关闭，风控状态码会自动熔断。
 type FcappKeepwarmMode = "responses" | "models";
+type FcappKeepwarmEndpointRole = "primary" | "fallback";
 
-interface FcappAdmissionRetryOptions {
-	retryRateLimit?: boolean;
+interface FcappKeepwarmEndpoint {
+	url: string;
+	role: FcappKeepwarmEndpointRole;
+}
+
+interface FcappKeepwarmAttemptResult {
+	ok: boolean;
+	status: number;
+	body?: string;
 }
 
 let fcappKeepwarmTimer: ReturnType<typeof setTimeout> | undefined;
@@ -268,7 +277,6 @@ async function fetchWithFcappAdmissionRetry(
 	url: string,
 	init: RequestInit,
 	label: string,
-	options: FcappAdmissionRetryOptions = {},
 ): Promise<Response> {
 	if (!isFcappAdmissionRetryEndpoint(url)) {
 		return fetch(url, init);
@@ -280,8 +288,6 @@ async function fetchWithFcappAdmissionRetry(
 
 		try {
 			const response = await fetch(url, init);
-			// 保温流量遇到限流时直接交给熔断器，避免沿用业务请求的秒级入场重试产生突发流量。
-			if (response.status === 429 && options.retryRateLimit === false) return response;
 			if (!FCAPP_ADMISSION_RETRY_STATUSES.has(response.status)) return response;
 
 			const body = await safeResponseText(response);
@@ -375,17 +381,27 @@ function fcappKeepwarmPath(): "/v1/models" | "/healthz" | "/" {
 	return "/v1/models";
 }
 
-function fcappKeepwarmEndpointFromRequest(requestUrl: string, mode: FcappKeepwarmMode): string | undefined {
+function fcappKeepwarmEndpointsFromRequest(requestUrl: string, mode: FcappKeepwarmMode): FcappKeepwarmEndpoint[] | undefined {
 	if (!isFcappAdmissionRetryEndpoint(requestUrl)) return undefined;
 	try {
 		const url = new URL(requestUrl);
-		if (mode === "responses") return url.toString();
-		url.pathname = fcappKeepwarmPath();
-		url.search = "";
-		url.hash = "";
-		return url.toString();
+		if (mode === "models") {
+			url.pathname = fcappKeepwarmPath();
+			url.search = "";
+			url.hash = "";
+		}
+
+		const primaryUrl = url.toString();
+		const fallbackUrl = new URL(FCAPP_KEEPWARM_FALLBACK_BASE_URL);
+		fallbackUrl.pathname = url.pathname;
+		fallbackUrl.search = url.search;
+		fallbackUrl.hash = "";
+		return [
+			{ url: primaryUrl, role: "primary" },
+			{ url: fallbackUrl.toString(), role: "fallback" },
+		];
 	} catch {
-		return mode === "responses" ? requestUrl : undefined;
+		return mode === "responses" ? [{ url: requestUrl, role: "primary" }] : undefined;
 	}
 }
 
@@ -404,9 +420,15 @@ function fcappKeepwarmStatusPath(url: string): string {
 	}
 }
 
-function fcappKeepwarmStatusTarget(url: string, mode: FcappKeepwarmMode, modelId?: string): string {
+function fcappKeepwarmStatusTarget(
+	url: string,
+	mode: FcappKeepwarmMode,
+	modelId?: string,
+	role: FcappKeepwarmEndpointRole = "primary",
+): string {
 	const method = mode === "responses" ? "POST" : "GET";
-	return `${method} ${fcappKeepwarmStatusPath(url)}${mode === "responses" && modelId ? ` ${modelId}` : ""}`;
+	const target = `${method} ${fcappKeepwarmStatusPath(url)}${mode === "responses" && modelId ? ` ${modelId}` : ""}`;
+	return role === "fallback" ? `${target} [备用 anyrouter.top]` : target;
 }
 
 function fcappKeepwarmStatusInterval(intervalMs: number): string {
@@ -458,6 +480,34 @@ async function drainResponseBody(response: Response): Promise<void> {
 	await response.text();
 }
 
+// 保温请求按地址逐个尝试，不能复用业务入口的无限 admission retry，否则主 FC 故障时无法切到备用。
+async function requestFcappKeepwarmEndpoint(
+	url: string,
+	init: RequestInit,
+	parentSignal: AbortSignal,
+): Promise<FcappKeepwarmAttemptResult> {
+	if (parentSignal.aborted) throw new Error("Request was aborted");
+	const controller = new AbortController();
+	const onParentAbort = () => controller.abort();
+	const timeout = setTimeout(() => controller.abort(), FCAPP_KEEPWARM_TIMEOUT_MS);
+	parentSignal.addEventListener("abort", onParentAbort, { once: true });
+	try {
+		const response = await fetch(url, { ...init, signal: controller.signal });
+		if (!response.ok) {
+			return {
+				ok: false,
+				status: response.status,
+				body: await safeResponseText(response),
+			};
+		}
+		await drainResponseBody(response);
+		return { ok: true, status: response.status };
+	} finally {
+		clearTimeout(timeout);
+		parentSignal.removeEventListener("abort", onParentAbort);
+	}
+}
+
 function setFcappKeepwarmStatus(text: string | undefined): void {
 	fcappKeepwarmStatusText = text;
 	fcappKeepwarmStatusSink?.(text);
@@ -484,7 +534,7 @@ function fcappKeepwarmRunActive(generation?: number): boolean {
 }
 
 async function runFcappKeepwarm(
-	url: string,
+	endpoints: FcappKeepwarmEndpoint[],
 	apiKey: string | undefined,
 	intervalMs: number | undefined,
 	mode: FcappKeepwarmMode,
@@ -494,72 +544,129 @@ async function runFcappKeepwarm(
 	if (fcappKeepwarmInFlight) return;
 	if (!fcappKeepwarmRunActive(generation)) return;
 	if (mode === "responses" && !modelId) return;
+	if (endpoints.length === 0) return;
 	fcappKeepwarmInFlight = true;
 	const attempt = ++fcappKeepwarmAttemptCount;
-	const requestUrl = mode === "models" ? fcappKeepwarmRequestUrl(url, attempt) : url;
-	const target = fcappKeepwarmStatusTarget(url, mode, modelId);
+	const primaryEndpoint = endpoints[0];
+	const primaryTarget = fcappKeepwarmStatusTarget(primaryEndpoint.url, mode, modelId, primaryEndpoint.role);
 	const controller = new AbortController();
 	fcappKeepwarmAbortController = controller;
-	const timeout = setTimeout(() => controller.abort(), FCAPP_KEEPWARM_TIMEOUT_MS);
 	try {
 		const headers: Record<string, string> = { "cache-control": "no-cache" };
 		if (apiKey) headers.authorization = `Bearer ${apiKey}`;
 		if (!fcappKeepwarmRunActive(generation)) return;
-		setFcappKeepwarmStatus(`FC保温: 请求中 #${fcappKeepwarmSuccessCount}/${attempt} ${target} ${intervalMs ? fcappKeepwarmStatusInterval(intervalMs) : ""}`.trim());
-		if (process.env.PI_CC_SWITCH_DEBUG === "1") {
-			console.info(`[cc-switch] FC keepwarm #${attempt}: ${mode === "responses" ? "POST" : "GET"} ${requestUrl}`);
-		}
+		setFcappKeepwarmStatus(`FC保温: 请求中 #${fcappKeepwarmSuccessCount}/${attempt} ${primaryTarget} ${intervalMs ? fcappKeepwarmStatusInterval(intervalMs) : ""}`.trim());
 
-		let response: Response;
 		if (mode === "responses") {
 			headers.accept = "text/event-stream";
 			headers["content-type"] = "application/json";
-			response = await fetchWithFcappAdmissionRetry(requestUrl, {
+		}
+		const requestInit: RequestInit = mode === "responses"
+			? {
 				method: "POST",
 				headers,
 				body: JSON.stringify(buildFcappKeepwarmResponsesPayload(modelId as string)),
-				signal: controller.signal,
-			}, "Codex keepwarm", { retryRateLimit: false });
-		} else {
-			response = await fetch(requestUrl, {
+			}
+			: {
 				method: "GET",
 				headers,
-				signal: controller.signal,
-			});
+			};
+
+		let failure:
+			| {
+				endpoint: FcappKeepwarmEndpoint;
+				requestUrl: string;
+				status?: number;
+				body?: string;
+				message?: string;
+			}
+			| undefined;
+		let successfulEndpoint: FcappKeepwarmEndpoint | undefined;
+
+		for (const endpoint of endpoints) {
+			if (!fcappKeepwarmRunActive(generation)) return;
+			const requestUrl = mode === "models" ? fcappKeepwarmRequestUrl(endpoint.url, attempt) : endpoint.url;
+			const target = fcappKeepwarmStatusTarget(endpoint.url, mode, modelId, endpoint.role);
+			if (process.env.PI_CC_SWITCH_DEBUG === "1") {
+				console.info(`[cc-switch] FC keepwarm #${attempt}: ${mode === "responses" ? "POST" : "GET"} ${requestUrl}`);
+			}
+			if (endpoint.role === "fallback") {
+				setFcappKeepwarmStatus(`FC保温: 尝试备用 anyrouter.top #${fcappKeepwarmSuccessCount}/${attempt} ${target}`);
+			}
+
+			try {
+				const result = await requestFcappKeepwarmEndpoint(requestUrl, requestInit, controller.signal);
+				if (!fcappKeepwarmRunActive(generation)) return;
+				if (result.ok) {
+					successfulEndpoint = endpoint;
+					break;
+				}
+				if (FCAPP_KEEPWARM_CIRCUIT_BREAKER_STATUSES.has(result.status)) {
+					// 鉴权失败、禁止访问或限流时立即停止自动流量，等待用户通过 /fc on 明确恢复。
+					tripFcappKeepwarmCircuit(result.status);
+					console.warn(`[cc-switch] FC keepwarm circuit opened: ${mode === "responses" ? "POST" : "GET"} ${requestUrl} -> HTTP ${result.status} ${result.body ?? ""}`);
+					return;
+				}
+				failure = { endpoint, requestUrl, status: result.status, body: result.body };
+				const retryableStatus = FCAPP_ADMISSION_RETRY_STATUSES.has(result.status);
+				if (!retryableStatus || isFcappAdmissionNonRetryableBody(result.body ?? "")) break;
+			} catch (error) {
+				if (!fcappKeepwarmRunActive(generation)) return;
+				failure = {
+					endpoint,
+					requestUrl,
+					message: error instanceof Error ? error.message : String(error),
+				};
+				if (!isAbortError(error) && !isFcappAdmissionRetryableError(error)) break;
+			}
+
+			if (endpoint.role === "primary" && endpoints.length > 1) {
+				const reason = failure?.status ? `HTTP ${failure.status}` : failure?.message ?? "连接失败";
+				setFcappKeepwarmStatus(`FC保温: 主地址失败 ${reason}，尝试备用 anyrouter.top #${fcappKeepwarmSuccessCount}/${attempt}`);
+			}
+		}
+
+		if (!successfulEndpoint) {
+			if (!failure || !fcappKeepwarmRunActive(generation)) return;
+			const target = fcappKeepwarmStatusTarget(failure.endpoint.url, mode, modelId, failure.endpoint.role);
+			if (failure.status !== undefined) {
+				const detail = compactLogText(failure.body ?? "");
+				setFcappKeepwarmStatus(`FC保温: 失败 HTTP ${failure.status}${detail ? ` ${detail}` : ""} #${fcappKeepwarmSuccessCount}/${attempt} ${target}`);
+				if (shouldLogFcappKeepwarmFailure()) {
+					console.warn(`[cc-switch] FC keepwarm failed: ${mode === "responses" ? "POST" : "GET"} ${failure.requestUrl} -> HTTP ${failure.status} ${failure.body ?? ""}`);
+				}
+			} else {
+				const message = failure.message ?? "请求失败";
+				setFcappKeepwarmStatus(`FC保温: 失败 ${message} #${fcappKeepwarmSuccessCount}/${attempt} ${target}`);
+				if (shouldLogFcappKeepwarmFailure()) {
+					console.warn(`[cc-switch] FC keepwarm failed: ${mode === "responses" ? "POST" : "GET"} ${failure.requestUrl} -> ${message}`);
+				}
+			}
+			return;
 		}
 
 		if (!fcappKeepwarmRunActive(generation)) return;
-		if (!response.ok) {
-			const body = await safeResponseText(response);
-			if (!fcappKeepwarmRunActive(generation)) return;
-			if (FCAPP_KEEPWARM_CIRCUIT_BREAKER_STATUSES.has(response.status)) {
-				// 鉴权失败、禁止访问或限流时立即停止自动流量，等待用户通过 /fc on 明确恢复。
-				tripFcappKeepwarmCircuit(response.status);
-				console.warn(`[cc-switch] FC keepwarm circuit opened: ${mode === "responses" ? "POST" : "GET"} ${requestUrl} -> HTTP ${response.status} ${body}`);
-				return;
-			}
-			const detail = compactLogText(body);
-			setFcappKeepwarmStatus(`FC保温: 失败 HTTP ${response.status}${detail ? ` ${detail}` : ""} #${fcappKeepwarmSuccessCount}/${attempt} ${target}`);
-			if (shouldLogFcappKeepwarmFailure()) {
-				console.warn(`[cc-switch] FC keepwarm failed: ${mode === "responses" ? "POST" : "GET"} ${requestUrl} -> HTTP ${response.status} ${body}`);
-			}
-		} else {
-			await drainResponseBody(response);
-			if (!fcappKeepwarmRunActive(generation)) return;
-			fcappKeepwarmSuccessCount += 1;
-			const successStatus = `FC保温: 最近成功 ${fcappKeepwarmStatusTime()} #${fcappKeepwarmSuccessCount}/${attempt} ${target} ${intervalMs ? fcappKeepwarmStatusInterval(intervalMs) : ""}`.trim();
-			fcappKeepwarmLastSuccessStatusText = successStatus;
-			setFcappKeepwarmStatus(successStatus);
+		fcappKeepwarmSuccessCount += 1;
+		const successTarget = fcappKeepwarmStatusTarget(
+			successfulEndpoint.url,
+			mode,
+			modelId,
+			successfulEndpoint.role,
+		);
+		const successStatus = `FC保温: 最近成功 ${fcappKeepwarmStatusTime()} #${fcappKeepwarmSuccessCount}/${attempt} ${successTarget} ${intervalMs ? fcappKeepwarmStatusInterval(intervalMs) : ""}`.trim();
+		fcappKeepwarmLastSuccessStatusText = successStatus;
+		setFcappKeepwarmStatus(successStatus);
+		if (successfulEndpoint.role === "fallback" && shouldLogFcappKeepwarmFailure()) {
+			console.warn(`[cc-switch] FC keepwarm primary unavailable; fallback succeeded: ${mode === "responses" ? "POST" : "GET"} ${successfulEndpoint.url}`);
 		}
 	} catch (error) {
 		if (!fcappKeepwarmRunActive(generation)) return;
 		const message = error instanceof Error ? error.message : String(error);
-		setFcappKeepwarmStatus(`FC保温: 失败 ${message} #${fcappKeepwarmSuccessCount}/${attempt} ${target}`);
+		setFcappKeepwarmStatus(`FC保温: 失败 ${message} #${fcappKeepwarmSuccessCount}/${attempt} ${primaryTarget}`);
 		if (shouldLogFcappKeepwarmFailure()) {
-			console.warn(`[cc-switch] FC keepwarm failed: ${mode === "responses" ? "POST" : "GET"} ${requestUrl} -> ${message}`);
+			console.warn(`[cc-switch] FC keepwarm failed unexpectedly: ${message}`);
 		}
 	} finally {
-		clearTimeout(timeout);
 		if (fcappKeepwarmAbortController === controller) fcappKeepwarmAbortController = undefined;
 		fcappKeepwarmInFlight = false;
 	}
@@ -574,8 +681,9 @@ function startFcappKeepwarm(
 ): boolean {
 	const mode = fcappKeepwarmMode();
 	if (mode === "responses" && !modelId) return false;
-	const keepwarmUrl = fcappKeepwarmEndpointFromRequest(requestUrl, mode);
-	if (!keepwarmUrl) return false;
+	const keepwarmEndpoints = fcappKeepwarmEndpointsFromRequest(requestUrl, mode);
+	if (!keepwarmEndpoints) return false;
+	const keepwarmUrl = keepwarmEndpoints[0].url;
 
 	// 记录最近一次可用的 FC 配置，便于 /fc 在运行期关闭后无需等下一轮真实请求即可重新开启。
 	fcappKeepwarmLastRequestUrl = requestUrl;
@@ -612,7 +720,7 @@ function startFcappKeepwarm(
 		const delayMs = fcappKeepwarmNextDelayMs(intervalMs);
 		fcappKeepwarmTimer = setTimeout(() => {
 			fcappKeepwarmTimer = undefined;
-			void runFcappKeepwarm(keepwarmUrl, apiKey, intervalMs, mode, modelId, generation).finally(scheduleNext);
+			void runFcappKeepwarm(keepwarmEndpoints, apiKey, intervalMs, mode, modelId, generation).finally(scheduleNext);
 		}, delayMs);
 		(fcappKeepwarmTimer as { unref?: () => void }).unref?.();
 	};
@@ -624,7 +732,7 @@ function startFcappKeepwarm(
 			console.info(`[cc-switch ${label}] FC keepwarm deferred after real request: ${target}`);
 		}
 	} else {
-		void runFcappKeepwarm(keepwarmUrl, apiKey, intervalMs, mode, modelId, generation).finally(scheduleNext);
+		void runFcappKeepwarm(keepwarmEndpoints, apiKey, intervalMs, mode, modelId, generation).finally(scheduleNext);
 		console.info(`[cc-switch ${label}] FC keepwarm enabled: ${target} every ${intervalMs}ms ±${Math.round(fcappKeepwarmJitterRatio() * 100)}%`);
 	}
 	return true;
