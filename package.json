@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "description": "Pi provider extension that imports active Codex and Claude settings from cc-switch.",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
   "keywords": [
     "pi-package",
     "pi-extension",
