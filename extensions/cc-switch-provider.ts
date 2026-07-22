@@ -122,13 +122,18 @@ interface FcappKeepwarmAttemptResult {
 	body?: string;
 }
 
+interface FcappKeepwarmProcessState {
+	enabledOverride?: boolean;
+}
+
+const FCAPP_KEEPWARM_PROCESS_STATE_KEY = Symbol.for("pi-cc-switch-provider.fcapp-keepwarm-state");
+
 let fcappKeepwarmTimer: ReturnType<typeof setTimeout> | undefined;
 let fcappKeepwarmUrl: string | undefined;
 let fcappKeepwarmModeState: FcappKeepwarmMode | undefined;
 let fcappKeepwarmModel: string | undefined;
 let fcappKeepwarmApiKey: string | undefined;
 let fcappKeepwarmAbortController: AbortController | undefined;
-let fcappKeepwarmRuntimeEnabled: boolean | undefined;
 let fcappKeepwarmLastRequestUrl: string | undefined;
 let fcappKeepwarmLastLabel: string | undefined;
 let fcappKeepwarmLastApiKey: string | undefined;
@@ -317,6 +322,18 @@ async function fetchWithFcappAdmissionRetry(
 	}
 }
 
+function fcappKeepwarmProcessState(): FcappKeepwarmProcessState {
+	const processGlobal = globalThis as typeof globalThis & {
+		[FCAPP_KEEPWARM_PROCESS_STATE_KEY]?: FcappKeepwarmProcessState;
+	};
+	const existing = processGlobal[FCAPP_KEEPWARM_PROCESS_STATE_KEY];
+	if (existing) return existing;
+
+	const created: FcappKeepwarmProcessState = {};
+	processGlobal[FCAPP_KEEPWARM_PROCESS_STATE_KEY] = created;
+	return created;
+}
+
 function fcappKeepwarmEnabledFromEnv(): boolean {
 	const raw = process.env[FCAPP_KEEPWARM_ENABLED_ENV]?.trim();
 	if (!raw) return true;
@@ -324,7 +341,7 @@ function fcappKeepwarmEnabledFromEnv(): boolean {
 }
 
 function fcappKeepwarmEnabled(): boolean {
-	return fcappKeepwarmRuntimeEnabled ?? fcappKeepwarmEnabledFromEnv();
+	return fcappKeepwarmProcessState().enabledOverride ?? fcappKeepwarmEnabledFromEnv();
 }
 
 function fcappKeepwarmMode(): FcappKeepwarmMode {
@@ -517,14 +534,19 @@ function fcappKeepwarmStatusLine(): string {
 	return fcappKeepwarmStatusText ?? `FC保温: ${fcappKeepwarmEnabled() ? "等待 fcapp 配置" : "已关闭"}`;
 }
 
-function tripFcappKeepwarmCircuit(status: number): void {
-	fcappKeepwarmRuntimeEnabled = false;
+function cleanupFcappKeepwarmRuntime(): void {
 	if (fcappKeepwarmTimer) {
 		clearTimeout(fcappKeepwarmTimer);
 		fcappKeepwarmTimer = undefined;
 	}
 	fcappKeepwarmGeneration += 1;
 	fcappKeepwarmAbortController?.abort();
+	fcappKeepwarmAbortController = undefined;
+}
+
+function tripFcappKeepwarmCircuit(status: number): void {
+	fcappKeepwarmProcessState().enabledOverride = false;
+	cleanupFcappKeepwarmRuntime();
 	const lastSuccess = fcappKeepwarmLastSuccessStatusText?.replace(/^FC保温:\s*/, "");
 	setFcappKeepwarmStatus(`FC保温: 已熔断 HTTP ${status}${lastSuccess ? `；${lastSuccess}` : ""}`);
 }
@@ -739,12 +761,7 @@ function startFcappKeepwarm(
 }
 
 function stopFcappKeepwarm(): void {
-	if (fcappKeepwarmTimer) {
-		clearTimeout(fcappKeepwarmTimer);
-		fcappKeepwarmTimer = undefined;
-	}
-	fcappKeepwarmGeneration += 1;
-	fcappKeepwarmAbortController?.abort();
+	cleanupFcappKeepwarmRuntime();
 	const lastSuccess = fcappKeepwarmLastSuccessStatusText?.replace(/^FC保温:\s*/, "");
 	setFcappKeepwarmStatus(lastSuccess ? `FC保温: 已关闭；${lastSuccess}` : "FC保温: 已关闭");
 }
@@ -2998,7 +3015,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const nextEnabled = action === "toggle" ? !fcappKeepwarmEnabled() : action === "on";
-			fcappKeepwarmRuntimeEnabled = nextEnabled;
+			fcappKeepwarmProcessState().enabledOverride = nextEnabled;
 			if (!nextEnabled) {
 				stopFcappKeepwarm();
 				ctx.ui.notify("FC保温已关闭；再次输入 /fc 可开启。", "info");
@@ -3014,6 +3031,13 @@ export default function (pi: ExtensionAPI) {
 			setFcappKeepwarmStatus("FC保温: 等待 fcapp 配置");
 			ctx.ui.notify("FC保温已开启；尚未捕获 FC 配置，下一次 cc-switch Codex/Claude 请求后会开始。", "info");
 		},
+	});
+
+	pi.on("session_shutdown", () => {
+		// Pi 会在 reload、新建/恢复/派生会话时重新加载扩展；必须清理当前实例，避免遗留幽灵保温任务。
+		// 进程级 enabledOverride 不在此处重置，确保当前窗口执行 /fc off 后跨会话重载仍保持关闭。
+		cleanupFcappKeepwarmRuntime();
+		fcappKeepwarmStatusSink = undefined;
 	});
 
 	pi.on("session_start", (_event, ctx) => {
