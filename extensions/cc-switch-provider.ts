@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, unwatchFile, watchFile, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, unwatchFile, watchFile, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -43,6 +43,19 @@ interface CodexConfig {
 	modelReasoningEffort?: string;
 }
 
+interface CcSwitchProviderLocalConfig {
+	codexSummary?: {
+		baseUrl?: string;
+	};
+}
+
+interface CodexSummaryRoute {
+	baseUrl: string;
+	apiKey: string;
+	model: string;
+	source: "env" | "config" | "default";
+}
+
 interface SseEvent {
 	event: string;
 	data: string;
@@ -64,6 +77,7 @@ const DEFAULT_CODEX_CONTEXT_WINDOW = 200000;
 const CODEX_CONTEXT_WINDOW_ENV = "PI_CC_SWITCH_CODEX_CONTEXT_WINDOW";
 const CODEX_SUMMARY_BASE_URL_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_BASE_URL";
 const DEFAULT_CODEX_SUMMARY_BASE_URL = "https://paid.tribiosapi.top/v1";
+const CC_SWITCH_PROVIDER_CONFIG_FILE = "cc-switch-provider.json";
 const CODEX_SUMMARY_MODEL_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_MODEL";
 const CODEX_SUMMARY_API_KEY_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_API_KEY";
 const CURRENT_CODEX_MODEL_ID = "current";
@@ -1273,40 +1287,76 @@ function findCodexProviderInCcSwitchDb(baseUrl: string): { apiKey?: string; mode
 	return undefined;
 }
 
-function codexSummaryFallbackBaseUrl(currentBaseUrl: string): string | undefined {
-	const explicit = process.env[CODEX_SUMMARY_BASE_URL_ENV]?.trim();
-	if (explicit) return explicit;
+function ccSwitchProviderConfigPath(): string {
+	return join(homedir(), ".pi", "agent", CC_SWITCH_PROVIDER_CONFIG_FILE);
+}
 
-	const current = normalizeUrlForCompare(currentBaseUrl);
-	if (normalizeUrlForCompare(DEFAULT_CODEX_SUMMARY_BASE_URL) !== current) {
-		return DEFAULT_CODEX_SUMMARY_BASE_URL;
+function loadCcSwitchProviderLocalConfig(): CcSwitchProviderLocalConfig | undefined {
+	const configPath = ccSwitchProviderConfigPath();
+	if (!existsSync(configPath)) return undefined;
+	const config = readJsonObject(configPath);
+	if (!config) {
+		throw new Error(`独立压缩中转配置文件不是有效的 JSON 对象：${configPath}`);
 	}
+	if (config.codexSummary !== undefined && !isRecord(config.codexSummary)) {
+		throw new Error(`独立压缩中转配置 codexSummary 必须是 JSON 对象：${configPath}`);
+	}
+	const codexSummary = isRecord(config.codexSummary) ? config.codexSummary : undefined;
+	return {
+		codexSummary: codexSummary
+			? { baseUrl: stringValue(codexSummary.baseUrl) }
+			: undefined,
+	};
+}
 
-	const codexDir = join(homedir(), ".codex");
-	if (!existsSync(codexDir)) return undefined;
-
-	let files: string[];
+function validateCodexSummaryBaseUrl(baseUrl: string): string {
 	try {
-		files = readdirSync(codexDir)
-			.filter((name) => /^config\.toml\.bak-/i.test(name))
-			.sort()
-			.reverse();
+		const parsed = new URL(baseUrl);
+		if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error("unsupported protocol");
+		return baseUrl;
 	} catch {
-		return undefined;
+		throw new Error(`独立压缩中转 baseUrl 必须是有效的 HTTP/HTTPS 地址：${baseUrl}`);
+	}
+}
+
+function codexSummaryBaseUrlConfig(): Pick<CodexSummaryRoute, "baseUrl" | "source"> {
+	const envBaseUrl = process.env[CODEX_SUMMARY_BASE_URL_ENV]?.trim();
+	if (envBaseUrl) return { baseUrl: validateCodexSummaryBaseUrl(envBaseUrl), source: "env" };
+
+	const fileBaseUrl = loadCcSwitchProviderLocalConfig()?.codexSummary?.baseUrl;
+	if (fileBaseUrl) return { baseUrl: validateCodexSummaryBaseUrl(fileBaseUrl), source: "config" };
+
+	return { baseUrl: DEFAULT_CODEX_SUMMARY_BASE_URL, source: "default" };
+}
+
+function resolveIndependentCodexSummaryRoute(): CodexSummaryRoute {
+	const { baseUrl, source } = codexSummaryBaseUrlConfig();
+	if (isFcappAdmissionRetryEndpoint(baseUrl)) {
+		throw new Error(`独立压缩中转不能指向不支持压缩的 FC 地址：${baseUrl}`);
 	}
 
-	for (const file of files) {
-		try {
-			const baseUrl = extractCodexBaseUrlFromConfigText(readFileSync(join(codexDir, file), "utf8"));
-			if (!baseUrl) continue;
-			if (normalizeUrlForCompare(baseUrl) === current) continue;
-			if (isFcappAdmissionRetryEndpoint(baseUrl)) continue;
-			return baseUrl;
-		} catch {
-			// 忽略不可读或格式不兼容的历史备份，继续尝试其他备份。
-		}
+	const provider = findCodexProviderInCcSwitchDb(baseUrl);
+	const model = process.env[CODEX_SUMMARY_MODEL_ENV]?.trim() || provider?.model;
+	const apiKey = process.env[CODEX_SUMMARY_API_KEY_ENV]?.trim() || provider?.apiKey;
+	if (!model || !apiKey) {
+		throw new Error(
+			`未找到独立压缩中转配置：${baseUrl}。请在 cc-switch 中添加 base_url 完全相同且包含模型和 API Key 的 Codex Provider，或设置 ${CODEX_SUMMARY_MODEL_ENV} 与 ${CODEX_SUMMARY_API_KEY_ENV}。`,
+		);
 	}
-	return undefined;
+	return { baseUrl, apiKey, model, source };
+}
+
+function codexSummaryRouteStatus(codex: CodexConfig): string {
+	if (!isFcappAdmissionRetryEndpoint(codex.baseUrl)) {
+		return `Codex Summary: 跟随当前中转 ${codex.baseUrl}`;
+	}
+	try {
+		const route = resolveIndependentCodexSummaryRoute();
+		const sourceLabel = route.source === "env" ? "环境变量" : route.source === "config" ? "配置文件" : "默认配置";
+		return `Codex Summary: ${route.model} -> ${route.baseUrl} [FC 独立压缩/${sourceLabel}]`;
+	} catch (error) {
+		return `Codex Summary: 配置错误 ${error instanceof Error ? error.message : String(error)}`;
+	}
 }
 
 function loadCodexConfig(): CodexConfig | undefined {
@@ -2690,53 +2740,38 @@ function streamCcSwitchCodexResponses(
 			const apiKey = resolveRuntimeCodexApiKey(options, liveCodex);
 			if (!apiKey) throw new Error("Missing cc-switch Codex credential");
 
-			const payload = buildOpenAIResponsesPayload(runtimeModel, context, options, liveCodex?.modelReasoningEffort);
+			const useIndependentSummaryRoute = isSummarizationContext(context) && isFcappAdmissionRetryEndpoint(runtimeModel.baseUrl);
+			const summaryRoute = useIndependentSummaryRoute ? resolveIndependentCodexSummaryRoute() : undefined;
+			const requestBaseUrl = summaryRoute?.baseUrl ?? runtimeModel.baseUrl;
+			const requestApiKey = summaryRoute?.apiKey ?? apiKey;
+			const requestModelId = summaryRoute?.model ?? runtimeModel.id;
+			const primaryPayload = buildOpenAIResponsesPayload(runtimeModel, context, options, liveCodex?.modelReasoningEffort);
+			const payload = requestModelId === runtimeModel.id ? primaryPayload : { ...primaryPayload, model: requestModelId };
 			const headers: Record<string, string> = {
 				accept: "text/event-stream",
 				"content-type": "application/json",
-				authorization: `Bearer ${apiKey}`,
+				authorization: `Bearer ${requestApiKey}`,
 			};
 
-			const endpoint = endpointForOpenAIResponses(runtimeModel.baseUrl);
-			writeDebugRequest(headers, payload, context, { route: "primary", endpoint });
-			let response = await fetchWithFcappAdmissionRetry(endpoint, {
+			const endpoint = endpointForOpenAIResponses(requestBaseUrl);
+			const route = summaryRoute ? "fc-independent-summary" : "primary";
+			writeDebugRequest(headers, payload, context, { route, endpoint, primaryEndpoint: summaryRoute ? endpointForOpenAIResponses(runtimeModel.baseUrl) : undefined });
+			const response = await fetchWithFcappAdmissionRetry(endpoint, {
 				method: "POST",
 				headers,
 				body: JSON.stringify(payload),
 				signal: options?.signal,
-			}, "Codex");
+			}, summaryRoute ? "Codex summary" : "Codex");
 
 			if (!response.ok) {
 				const errorText = await response.text();
-				const fallbackBaseUrl = isSummarizationContext(context) && /invalid_responses_request|invalid codex request/i.test(errorText)
-					? codexSummaryFallbackBaseUrl(runtimeModel.baseUrl)
-					: undefined;
-				if (fallbackBaseUrl) {
-					const fallbackProvider = findCodexProviderInCcSwitchDb(fallbackBaseUrl);
-					const fallbackModelId = process.env[CODEX_SUMMARY_MODEL_ENV]?.trim() || fallbackProvider?.model || runtimeModel.id;
-					const fallbackPayload = fallbackModelId === runtimeModel.id ? payload : { ...payload, model: fallbackModelId };
-					const fallbackApiKey = process.env[CODEX_SUMMARY_API_KEY_ENV]?.trim() || fallbackProvider?.apiKey || apiKey;
-					const fallbackHeaders = { ...headers, authorization: `Bearer ${fallbackApiKey}` };
-					const fallbackEndpoint = endpointForOpenAIResponses(fallbackBaseUrl);
-					console.warn(`[cc-switch Codex] compact summary fallback: ${endpoint} -> ${fallbackEndpoint}`);
-					writeDebugRequest(fallbackHeaders, fallbackPayload, context, { route: "summary-fallback", endpoint: fallbackEndpoint, primaryEndpoint: endpoint });
-					response = await fetchWithFcappAdmissionRetry(fallbackEndpoint, {
-						method: "POST",
-						headers: fallbackHeaders,
-						body: JSON.stringify(fallbackPayload),
-						signal: options?.signal,
-					}, "Codex summary fallback");
-					if (!response.ok) {
-						throw new Error(`cc-switch Codex request failed: ${response.status} ${await response.text()}`);
-					}
-				} else {
-					throw new Error(`cc-switch Codex request failed: ${response.status} ${errorText}`);
-				}
+				const requestKind = summaryRoute ? "summary request" : "request";
+				throw new Error(`cc-switch Codex ${requestKind} failed: ${response.status} ${errorText} (${endpoint})`);
 			}
 			if (!response.body) {
-				throw new Error("cc-switch Codex response did not include a stream body");
+				throw new Error(`cc-switch Codex${summaryRoute ? " summary" : ""} response did not include a stream body`);
 			}
-			startFcappKeepwarm(endpoint, "Codex", apiKey, runtimeModel.id, true);
+			startFcappKeepwarm(endpoint, "Codex", requestApiKey, requestModelId, true);
 
 			stream.push({ type: "start", partial: output });
 			await processOpenAIResponsesSse(response, output, stream, runtimeModel);
@@ -2995,6 +3030,7 @@ export default function (pi: ExtensionAPI) {
 				liveCodex
 					? `Codex: cc-switch-codex/${liveCodex.model} -> ${liveCodex.baseUrl}`
 					: loadDiagnostics.codex ?? "Codex: no ~/.codex provider found",
+				liveCodex ? codexSummaryRouteStatus(liveCodex) : "Codex Summary: unavailable",
 				fcappKeepwarmStatusLine(),
 			];
 			ctx.ui.notify(lines.join("\n"), "info");
