@@ -810,6 +810,10 @@ function isSummarizationContext(context: Context): boolean {
 	return /context summarization assistant/i.test(context.systemPrompt ?? "");
 }
 
+function isTaskContinuationAssessmentContext(context: Context): boolean {
+	return /task-continuation classifier/i.test(context.systemPrompt ?? "");
+}
+
 function stringContent(value: unknown): string | undefined {
 	return typeof value === "string" ? value : undefined;
 }
@@ -2407,7 +2411,10 @@ function buildOpenAIResponsesPayload(
 	modelReasoningEffort?: string,
 ): Record<string, unknown> {
 	const summarizationContext = isSummarizationContext(context);
-	const summarizationInstructions = "You are Codex, a coding agent. Produce only the requested structured context summary.";
+	const taskContinuationAssessment = isTaskContinuationAssessmentContext(context);
+	const summarizationInstructions = taskContinuationAssessment
+		? "You are a task-continuation classifier. Produce only the single status token requested by the input."
+		: "You are Codex, a coding agent. Produce only the requested structured context summary.";
 	const payloadContext: Context = summarizationContext
 		? {
 			...context,
