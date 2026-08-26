@@ -131,6 +131,14 @@ const TEXT_INPUT = ["text"] as ("text" | "image")[];
 const TEXT_IMAGE_INPUT = ["text", "image"] as ("text" | "image")[];
 const DEFAULT_CODEX_CONTEXT_WINDOW = 200000;
 const CODEX_CONTEXT_WINDOW_ENV = "PI_CC_SWITCH_CODEX_CONTEXT_WINDOW";
+const DEFAULT_CC_SWITCH_COMPACTION_TRIGGER_RATIO = 0.85;
+const CC_SWITCH_EARLY_COMPACTION_ENV = "PI_CC_SWITCH_EARLY_COMPACTION";
+const CC_SWITCH_COMPACTION_TRIGGER_RATIO_ENV = "PI_CC_SWITCH_COMPACTION_TRIGGER_RATIO";
+const CC_SWITCH_COMPACTION_TRIGGER_TOKENS_ENV = "PI_CC_SWITCH_COMPACTION_TRIGGER_TOKENS";
+const CC_SWITCH_COMPACTION_STATUS_KEY = "cc-switch-compaction";
+const CC_SWITCH_COMPACTION_CONTINUATION_TYPE = "cc-switch-compaction-continuation";
+const CC_SWITCH_COMPACTION_CONTINUATION_PROMPT =
+	"Automatic context compaction interrupted an unfinished tool-use turn. Continue the user's current task from the compaction summary and retained messages. Do not ask the user to repeat the request or redo completed work; inspect the current state and proceed with the next unfinished step.";
 const CODEX_SUMMARY_BASE_URL_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_BASE_URL";
 const DEFAULT_CODEX_SUMMARY_BASE_URL = "https://paid.tribiosapi.top/v1";
 const CC_SWITCH_PROVIDER_CONFIG_FILE = "cc-switch-provider.json";
@@ -1019,6 +1027,34 @@ function parseFcappKeepwarmCommandAction(args: string | undefined): FcappKeepwar
 
 function codexContextWindow(): number {
 	return positiveIntegerEnv(CODEX_CONTEXT_WINDOW_ENV) ?? DEFAULT_CODEX_CONTEXT_WINDOW;
+}
+
+function isCcSwitchProvider(provider: string | undefined): boolean {
+	return provider === "cc-switch-codex" || provider === "cc-switch-claude";
+}
+
+function ccSwitchEarlyCompactionEnabled(): boolean {
+	const raw = process.env[CC_SWITCH_EARLY_COMPACTION_ENV]?.trim();
+	if (!raw) return true;
+	return !/^(0|false|no|off)$/i.test(raw);
+}
+
+function ccSwitchCompactionTriggerTokens(contextWindow: number): number {
+	const explicitTokens = positiveIntegerEnv(CC_SWITCH_COMPACTION_TRIGGER_TOKENS_ENV);
+	if (explicitTokens !== undefined) {
+		return Math.min(explicitTokens, Math.max(1, contextWindow - 1));
+	}
+
+	const rawRatio = process.env[CC_SWITCH_COMPACTION_TRIGGER_RATIO_ENV]?.trim();
+	if (rawRatio) {
+		const ratio = Number(rawRatio);
+		if (Number.isFinite(ratio) && ratio > 0 && ratio < 1) {
+			return Math.max(1, Math.floor(contextWindow * ratio));
+		}
+		console.warn(`[cc-switch] Ignore invalid ${CC_SWITCH_COMPACTION_TRIGGER_RATIO_ENV}=${rawRatio}; expected a number between 0 and 1`);
+	}
+
+	return Math.max(1, Math.floor(contextWindow * DEFAULT_CC_SWITCH_COMPACTION_TRIGGER_RATIO));
 }
 
 function isSummarizationContext(context: Context): boolean {
@@ -3242,6 +3278,18 @@ function streamCcSwitchAnthropic(
 }
 
 export default function (pi: ExtensionAPI) {
+	let previousContextTokens: number | undefined;
+	let previousCompactionTriggerTokens: number | undefined;
+	let earlyCompactionRetryAtTokens: number | undefined;
+	let earlyCompactionInFlight = false;
+
+	const resetEarlyCompactionState = () => {
+		previousContextTokens = undefined;
+		previousCompactionTriggerTokens = undefined;
+		earlyCompactionRetryAtTokens = undefined;
+		earlyCompactionInFlight = false;
+	};
+
 	// Re-evaluate device-local directory overrides and capture one coherent registration snapshot on every load/reload.
 	activeCcSwitchCliPaths = resolveCcSwitchCliPaths(homedir());
 	const localConfigPath = ccSwitchProviderConfigPath();
@@ -3434,13 +3482,115 @@ export default function (pi: ExtensionAPI) {
 		cleanupFcappKeepwarmRuntime();
 		cleanupSelectiveProxy();
 		fcappKeepwarmStatusSink = undefined;
+		resetEarlyCompactionState();
 	});
 
 	pi.on("session_start", (_event, ctx) => {
+		resetEarlyCompactionState();
 		installCcSwitchFooter(pi, ctx, routingMode, routingSnapshot.codex);
 		ctx.ui.setStatus(CC_SWITCH_ROUTING_STATUS_KEY, routingModeFooterStatus(routingMode));
 		fcappKeepwarmStatusSink = (text) => ctx.ui.setStatus(FCAPP_KEEPWARM_STATUS_KEY, text);
 		fcappKeepwarmStatusSink(fcappKeepwarmStatusText);
+		ctx.ui.setStatus(CC_SWITCH_COMPACTION_STATUS_KEY, undefined);
+	});
+
+	pi.on("model_select", (_event, ctx) => {
+		resetEarlyCompactionState();
+		ctx.ui.setStatus(CC_SWITCH_COMPACTION_STATUS_KEY, undefined);
+	});
+
+	pi.on("session_compact", (_event, ctx) => {
+		resetEarlyCompactionState();
+		ctx.ui.setStatus(CC_SWITCH_COMPACTION_STATUS_KEY, undefined);
+	});
+
+	// Pi 0.74.2 compacts at the end of a successful agent run but deliberately
+	// does not continue afterward. Compact at a turn boundary while a tool chain
+	// is still active, then enqueue a hidden follow-up to resume that chain.
+	pi.on("turn_end", (event, ctx) => {
+		if (!ccSwitchEarlyCompactionEnabled() || !isCcSwitchProvider(ctx.model?.provider)) {
+			resetEarlyCompactionState();
+			return;
+		}
+
+		const usage = ctx.getContextUsage();
+		const currentTokens = usage?.tokens;
+		const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
+		if (currentTokens === null || currentTokens === undefined || contextWindow <= 0) {
+			resetEarlyCompactionState();
+			return;
+		}
+
+		const triggerTokens = ccSwitchCompactionTriggerTokens(contextWindow);
+		const triggerChanged = previousCompactionTriggerTokens !== undefined &&
+			previousCompactionTriggerTokens !== triggerTokens;
+		const crossedTrigger = currentTokens > triggerTokens && (
+			previousContextTokens === undefined ||
+			previousContextTokens <= triggerTokens ||
+			triggerChanged
+		);
+		const retryDue = earlyCompactionRetryAtTokens !== undefined && currentTokens >= earlyCompactionRetryAtTokens;
+		previousContextTokens = currentTokens;
+		previousCompactionTriggerTokens = triggerTokens;
+		if ((!crossedTrigger && !retryDue) || earlyCompactionInFlight) return;
+
+		// compact() aborts the current continuation and clears queued messages.
+		// Never interfere with an explicit user message already waiting.
+		if (ctx.hasPendingMessages()) {
+			previousContextTokens = triggerTokens;
+			return;
+		}
+
+		if (event.message.role !== "assistant" || event.message.stopReason !== "toolUse") return;
+
+		earlyCompactionRetryAtTokens = undefined;
+		earlyCompactionInFlight = true;
+		const status = `自动压缩: ${formatFooterTokens(currentTokens)} > ${formatFooterTokens(triggerTokens)}`;
+		ctx.ui.setStatus(CC_SWITCH_COMPACTION_STATUS_KEY, status);
+		if (ctx.hasUI) ctx.ui.notify(`${status}，正在生成摘要`, "info");
+		ctx.compact({
+			onComplete: (result) => {
+				// Avoid immediately compacting again if the retained context remains
+				// above the threshold; wait for a new below-to-above crossing.
+				previousContextTokens = Math.max(currentTokens, triggerTokens + 1);
+				previousCompactionTriggerTokens = triggerTokens;
+				earlyCompactionRetryAtTokens = undefined;
+				earlyCompactionInFlight = false;
+				ctx.ui.setStatus(CC_SWITCH_COMPACTION_STATUS_KEY, undefined);
+
+				const canResume = !ctx.hasPendingMessages();
+				if (canResume) {
+					pi.sendMessage(
+						{
+							customType: CC_SWITCH_COMPACTION_CONTINUATION_TYPE,
+							content: CC_SWITCH_COMPACTION_CONTINUATION_PROMPT,
+							display: false,
+							details: { reason: "early-compaction", tokensBefore: result.tokensBefore },
+						},
+						{ triggerTurn: true, deliverAs: "followUp" },
+					);
+				}
+				if (ctx.hasUI) {
+					ctx.ui.notify(
+						canResume ? "上下文自动压缩完成，正在继续未完成的任务" : "上下文自动压缩完成",
+						"info",
+					);
+				}
+			},
+			onError: (error) => {
+				earlyCompactionInFlight = false;
+				// Wait for more context before retrying, avoiding a compaction loop
+				// when the summary route is temporarily unavailable.
+				const retryStep = Math.max(1000, Math.floor(contextWindow * 0.05));
+				earlyCompactionRetryAtTokens = Math.min(
+					currentTokens + retryStep,
+					Math.max(currentTokens, contextWindow - 1000),
+				);
+				previousContextTokens = currentTokens;
+				ctx.ui.setStatus(CC_SWITCH_COMPACTION_STATUS_KEY, undefined);
+				if (ctx.hasUI) ctx.ui.notify(`上下文自动压缩失败: ${error.message}`, "error");
+			},
+		});
 	});
 
 	pi.on("tool_execution_start", (event, ctx) => {
