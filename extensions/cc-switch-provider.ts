@@ -129,9 +129,10 @@ type StreamBlock =
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const TEXT_INPUT = ["text"] as ("text" | "image")[];
 const TEXT_IMAGE_INPUT = ["text", "image"] as ("text" | "image")[];
-const DEFAULT_CODEX_CONTEXT_WINDOW = 200000;
+const DEFAULT_CODEX_CONTEXT_WINDOW = 258400;
 const CODEX_CONTEXT_WINDOW_ENV = "PI_CC_SWITCH_CODEX_CONTEXT_WINDOW";
 const DEFAULT_CC_SWITCH_COMPACTION_TRIGGER_RATIO = 0.85;
+const DEFAULT_CODEX_COMPACTION_TRIGGER_RATIO = 0.88;
 const CC_SWITCH_EARLY_COMPACTION_ENV = "PI_CC_SWITCH_EARLY_COMPACTION";
 const CC_SWITCH_COMPACTION_TRIGGER_RATIO_ENV = "PI_CC_SWITCH_COMPACTION_TRIGGER_RATIO";
 const CC_SWITCH_COMPACTION_TRIGGER_TOKENS_ENV = "PI_CC_SWITCH_COMPACTION_TRIGGER_TOKENS";
@@ -1039,7 +1040,7 @@ function ccSwitchEarlyCompactionEnabled(): boolean {
 	return !/^(0|false|no|off)$/i.test(raw);
 }
 
-function ccSwitchCompactionTriggerTokens(contextWindow: number): number {
+function ccSwitchCompactionTriggerTokens(contextWindow: number, provider: string | undefined): number {
 	const explicitTokens = positiveIntegerEnv(CC_SWITCH_COMPACTION_TRIGGER_TOKENS_ENV);
 	if (explicitTokens !== undefined) {
 		return Math.min(explicitTokens, Math.max(1, contextWindow - 1));
@@ -1054,7 +1055,10 @@ function ccSwitchCompactionTriggerTokens(contextWindow: number): number {
 		console.warn(`[cc-switch] Ignore invalid ${CC_SWITCH_COMPACTION_TRIGGER_RATIO_ENV}=${rawRatio}; expected a number between 0 and 1`);
 	}
 
-	return Math.max(1, Math.floor(contextWindow * DEFAULT_CC_SWITCH_COMPACTION_TRIGGER_RATIO));
+	const defaultRatio = provider === "cc-switch-codex"
+		? DEFAULT_CODEX_COMPACTION_TRIGGER_RATIO
+		: DEFAULT_CC_SWITCH_COMPACTION_TRIGGER_RATIO;
+	return Math.max(1, Math.floor(contextWindow * defaultRatio));
 }
 
 function isSummarizationContext(context: Context): boolean {
@@ -3521,7 +3525,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const triggerTokens = ccSwitchCompactionTriggerTokens(contextWindow);
+		const triggerTokens = ccSwitchCompactionTriggerTokens(contextWindow, ctx.model?.provider);
 		const triggerChanged = previousCompactionTriggerTokens !== undefined &&
 			previousCompactionTriggerTokens !== triggerTokens;
 		const crossedTrigger = currentTokens > triggerTokens && (

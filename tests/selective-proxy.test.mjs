@@ -5,6 +5,7 @@ import {
 	AGENTROUTER_HOST,
 	ANYROUTER_PROXY_ENV,
 	DEFAULT_ANYROUTER_PROXY_URL,
+	isAgentrouterHttpsUrl,
 	isAnyrouterHttpsUrl,
 	isSelectiveProxyHttpsUrl,
 	parseAnyrouterProxyUrl,
@@ -19,6 +20,16 @@ test("matches only the exact anyrouter HTTPS hostname", () => {
 	assert.equal(isAnyrouterHttpsUrl("https://api.anyrouter.top/v1/responses"), false);
 	assert.equal(isAnyrouterHttpsUrl("https://bestcf.030101.xyz/v1/responses"), false);
 	assert.equal(isAnyrouterHttpsUrl("not a URL"), false);
+});
+
+test("matches only the exact agentrouter HTTPS hostname", () => {
+	assert.equal(AGENTROUTER_HOST, "agentrouter.org");
+	assert.equal(isAgentrouterHttpsUrl("https://agentrouter.org/v1/responses"), true);
+	assert.equal(isAgentrouterHttpsUrl("https://AGENTROUTER.ORG:443/v1/models"), true);
+	assert.equal(isAgentrouterHttpsUrl("http://agentrouter.org/v1/responses"), false);
+	assert.equal(isAgentrouterHttpsUrl("https://api.agentrouter.org/v1/responses"), false);
+	assert.equal(isAgentrouterHttpsUrl("https://agentrouter.org.evil.example/v1/responses"), false);
+	assert.equal(isAgentrouterHttpsUrl("not a URL"), false);
 });
 
 test("matches only the exact HTTPS hostnames configured for the selective proxy", () => {

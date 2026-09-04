@@ -265,7 +265,7 @@ The extension registers `cc-switch-codex/current`. In `live` routing mode Respon
 
 At startup or `/reload`, when the top-level `model_catalog_json` points to the CC Switch-owned filename `cc-switch-model-catalog.json`, the extension imports the catalog's validated model IDs, display names, context windows, reasoning flag, and input modalities. A valid non-empty catalog replaces the fixed Codex list. If the pointer is absent, user-owned, missing, oversized, malformed, or empty, the extension preserves the legacy fallback: the concrete current model plus `gpt-5.5` and `gpt-5.6-sol`.
 
-Only the `current` alias follows later live model changes. Selecting a concrete catalog model sends that selected model ID. Catalog context windows are capped by `PI_CC_SWITCH_CODEX_CONTEXT_WINDOW` (200,000 by default), and the importer ignores every catalog field outside its metadata allowlist. Restart Pi or run `/reload` after CC Switch changes the catalog.
+Only the `current` alias follows later live model changes. Selecting a concrete catalog model sends that selected model ID. Catalog context windows are capped by `PI_CC_SWITCH_CODEX_CONTEXT_WINDOW` (258,400 by default), and the importer ignores every catalog field outside its metadata allowlist. Restart Pi or run `/reload` after CC Switch changes the catalog.
 
 When the effective model is `gpt-5.6-sol`, normal Responses requests use the top-level `model_reasoning_effort` value from `config.toml` directly as `reasoning.effort` (including provider-specific values such as `ultra`) instead of mapping through Pi's built-in thinking levels. The interactive footer watches `config.toml` and displays this effective value instead of the Shift+Tab level. Compaction and branch-summary requests keep their existing recovery-specific reasoning behavior.
 
@@ -275,7 +275,7 @@ When the effective model is `gpt-5.6-sol`, normal Responses requests use the top
 
 ### Codex Context and Compaction
 
-`cc-switch-codex` uses a conservative default context window of 200,000 tokens. This helps Pi compact before the upstream cc-switch Codex channel rejects a request with `context_length_exceeded`, even if the displayed Codex model advertises a larger cached context.
+`cc-switch-codex` uses a default context window of 258,400 tokens. Early tool-chain compaction starts at 88% (227,392 tokens), leaving 31,008 tokens for continuation and recovery before the window is exhausted. Claude keeps its existing 85% default trigger.
 
 Set `PI_CC_SWITCH_CODEX_CONTEXT_WINDOW` to override the value, for example:
 
@@ -587,13 +587,13 @@ $env:NODE_USE_ENV_PROXY = "1"
 
 启动或执行 `/reload` 时，如果顶层 `model_catalog_json` 指向 CC Switch 所有的文件名 `cc-switch-model-catalog.json`，扩展会导入 catalog 中通过校验的模型 ID、显示名、上下文窗口、reasoning 标记和输入模态。有效且非空的 catalog 会替代固定 Codex 列表；如果指针缺失、属于用户自定义文件、文件不存在、过大、格式错误或为空，则保留旧回退列表：当前具体模型以及 `gpt-5.5`、`gpt-5.6-sol`。
 
-只有 `current` alias 会继续跟随之后的 live 模型变化；选择 catalog 中的具体模型时，请求会保留该模型 ID。catalog 上下文仍受 `PI_CC_SWITCH_CODEX_CONTEXT_WINDOW` 限制（默认 200,000），导入器会忽略元数据白名单之外的全部字段。CC Switch 修改 catalog 后，需要重启 Pi 或执行 `/reload`。
+只有 `current` alias 会继续跟随之后的 live 模型变化；选择 catalog 中的具体模型时，请求会保留该模型 ID。catalog 上下文仍受 `PI_CC_SWITCH_CODEX_CONTEXT_WINDOW` 限制（默认 258,400），导入器会忽略元数据白名单之外的全部字段。CC Switch 修改 catalog 后，需要重启 Pi 或执行 `/reload`。
 
 实际模型为 `gpt-5.6-sol` 时，普通 Responses 请求会直接读取 `config.toml` 顶层的 `model_reasoning_effort`，并原样作为 `reasoning.effort` 发送（包括 `ultra` 等中转自定义值），不再经过 Pi 内置 thinking 档位映射。交互式页脚会监听 `config.toml`，并用该实际生效值覆盖 Shift+Tab 档位显示。上下文压缩和分支摘要请求继续保留既有的恢复专用 reasoning 策略。
 
 ### Codex 上下文与压缩
 
-`cc-switch-codex` 默认使用保守的 200,000 token 上下文窗口。即使 Codex 模型展示了更大的缓存上下文，这也能让 Pi 在上游 cc-switch Codex 通道返回 `context_length_exceeded` 前提前压缩。
+`cc-switch-codex` 默认使用 258,400 token 上下文窗口。工具链提前压缩默认在 88%（227,392 token）触发，在耗尽窗口前保留 31,008 token 供任务续接和异常恢复；Claude 继续使用原有的 85% 默认触发比例。
 
 如需覆盖该值，可设置 `PI_CC_SWITCH_CODEX_CONTEXT_WINDOW`，例如：
 

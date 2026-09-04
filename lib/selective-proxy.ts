@@ -7,13 +7,21 @@ const SELECTIVE_PROXY_HOSTS = new Set([ANYROUTER_HOST, AGENTROUTER_HOST]);
 
 const DISABLED_ANYROUTER_PROXY_VALUES = new Set(["0", "false", "no", "off", "direct"]);
 
-export function isAnyrouterHttpsUrl(value: string): boolean {
+function isExactHttpsHost(value: string, host: string): boolean {
 	try {
 		const url = new URL(value);
-		return url.protocol === "https:" && url.hostname.toLowerCase() === ANYROUTER_HOST;
+		return url.protocol === "https:" && url.hostname.toLowerCase() === host;
 	} catch {
 		return false;
 	}
+}
+
+export function isAnyrouterHttpsUrl(value: string): boolean {
+	return isExactHttpsHost(value, ANYROUTER_HOST);
+}
+
+export function isAgentrouterHttpsUrl(value: string): boolean {
+	return isExactHttpsHost(value, AGENTROUTER_HOST);
 }
 
 export function isSelectiveProxyHttpsUrl(value: string): boolean {
