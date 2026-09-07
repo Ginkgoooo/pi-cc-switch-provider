@@ -147,7 +147,7 @@ const CC_SWITCH_ROUTING_STATUS_KEY = "cc-switch-routing-mode";
 const CODEX_SUMMARY_MODEL_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_MODEL";
 const CODEX_SUMMARY_API_KEY_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_API_KEY";
 const CURRENT_CODEX_MODEL_ID = "current";
-const DEFAULT_CODEX_MODELS = ["gpt-5.5", "gpt-5.6-sol"] as const;
+const DEFAULT_CODEX_MODELS = ["gpt-5.5", "gpt-5.6-sol", "gpt-6-astra"] as const;
 const CODEX_CONFIG_REASONING_MODEL = "gpt-5.6-sol";
 const CURRENT_CLAUDE_MODEL_ID = "current";
 // 与 DEFAULT_CODEX_MODELS 同理：除了 cc-switch 当前模型，再固定暴露一组可切换的 Claude 模型。
