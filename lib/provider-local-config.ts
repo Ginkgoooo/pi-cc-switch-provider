@@ -6,6 +6,8 @@ export type CcSwitchRoutingMode = "live" | "fixed";
 export interface CcSwitchProviderLocalConfig {
 	routingMode: CcSwitchRoutingMode;
 	codexSummary?: {
+		/** 独立摘要使用的 cc-switch Codex Provider ID；不保存 API Key。 */
+		providerId?: string;
 		baseUrl?: string;
 	};
 }
@@ -50,10 +52,15 @@ export function readCcSwitchProviderLocalConfig(filePath: string): CcSwitchProvi
 		throw new Error(`cc-switch-provider codexSummary 必须是 JSON 对象：${filePath}`);
 	}
 	const codexSummary = isRecord(config.codexSummary) ? config.codexSummary : undefined;
+	const providerId = codexSummary ? nonEmptyString(codexSummary.providerId) : undefined;
+	const baseUrl = codexSummary ? nonEmptyString(codexSummary.baseUrl) : undefined;
 	return {
 		routingMode: parseCcSwitchRoutingMode(config.routingMode, filePath),
-		codexSummary: codexSummary
-			? { baseUrl: nonEmptyString(codexSummary.baseUrl) }
+		codexSummary: codexSummary && (providerId || baseUrl)
+			? {
+				...(providerId ? { providerId } : {}),
+				...(baseUrl ? { baseUrl } : {}),
+			}
 			: undefined,
 	};
 }

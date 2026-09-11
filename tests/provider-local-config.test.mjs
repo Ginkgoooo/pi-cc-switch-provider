@@ -30,16 +30,22 @@ test("missing local config defaults to live routing", () => {
 	});
 });
 
-test("local config reads fixed mode without changing codex summary settings", () => {
+test("local config reads fixed mode and explicit summary provider binding", () => {
 	withTempDirectory((directory) => {
 		const configPath = join(directory, "cc-switch-provider.json");
 		writeFileSync(configPath, JSON.stringify({
 			routingMode: "fixed",
-			codexSummary: { baseUrl: " https://summary.test/v1 " },
+			codexSummary: {
+				providerId: " buzz-123 ",
+				baseUrl: " https://summary.test/v1 ",
+			},
 		}), "utf8");
 		assert.deepEqual(readCcSwitchProviderLocalConfig(configPath), {
 			routingMode: "fixed",
-			codexSummary: { baseUrl: "https://summary.test/v1" },
+			codexSummary: {
+				providerId: "buzz-123",
+				baseUrl: "https://summary.test/v1",
+			},
 		});
 	});
 });
@@ -53,13 +59,19 @@ test("routing mode writer preserves existing and unknown fields", () => {
 
 		writeFileSync(configPath, JSON.stringify({
 			routingMode: "fixed",
-			codexSummary: { baseUrl: "https://summary.test/v1" },
+			codexSummary: {
+				providerId: "summary-provider",
+				baseUrl: "https://summary.test/v1",
+			},
 			futureSetting: { enabled: true },
 		}), "utf8");
 		writeCcSwitchRoutingMode(configPath, "live");
 		assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), {
 			routingMode: "live",
-			codexSummary: { baseUrl: "https://summary.test/v1" },
+			codexSummary: {
+				providerId: "summary-provider",
+				baseUrl: "https://summary.test/v1",
+			},
 			futureSetting: { enabled: true },
 		});
 		assert.deepEqual(readdirSync(join(directory, "nested")), ["cc-switch-provider.json"]);

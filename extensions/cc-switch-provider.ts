@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
 import { existsSync, readFileSync, unwatchFile, watchFile, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -109,6 +110,7 @@ interface CodexSummaryRoute {
 	baseUrl: string;
 	apiKey: string;
 	model: string;
+	providerId?: string;
 	source: "env" | "config" | "default";
 }
 
@@ -1492,42 +1494,123 @@ function normalizeUrlForCompare(value: string): string {
 	return value.replace(/\/+$/, "").toLowerCase();
 }
 
-function readCcSwitchDbText(): string | undefined {
-	const dbPath = join(homedir(), ".cc-switch", "cc-switch.db");
-	if (!existsSync(dbPath)) return undefined;
+interface CodexSummaryProviderRecord {
+	providerId: string;
+	apiKey?: string;
+	model?: string;
+	baseUrl: string;
+}
+
+interface CcSwitchProviderRow {
+	id: string;
+	settings_config: string;
+}
+
+interface SqliteStatement {
+	all(...parameters: unknown[]): unknown[];
+}
+
+interface SqliteDatabase {
+	prepare(sql: string): SqliteStatement;
+	close(): void;
+}
+
+type SqliteDatabaseSyncConstructor = new (
+	path: string,
+	options: { readOnly: boolean },
+) => SqliteDatabase;
+
+const requireForExtension = createRequire(import.meta.url);
+
+function parseCcSwitchProviderRow(row: CcSwitchProviderRow): CodexSummaryProviderRecord | undefined {
+	if (typeof row.id !== "string" || typeof row.settings_config !== "string") return undefined;
+	let settings: unknown;
 	try {
-		return readFileSync(dbPath).toString("utf8");
+		settings = JSON.parse(row.settings_config) as unknown;
 	} catch {
+		console.warn(`[cc-switch] Ignore malformed settings_config for Codex Provider ${row.id}`);
 		return undefined;
 	}
+	if (!isRecord(settings)) return undefined;
+	const auth = isRecord(settings.auth) ? settings.auth : undefined;
+	const configText = stringValue(settings.config);
+	if (!configText) return undefined;
+	const configBaseUrl = extractCodexBaseUrlFromConfigText(configText);
+	if (!configBaseUrl) return undefined;
+	return {
+		providerId: row.id,
+		apiKey: stringValue(auth?.OPENAI_API_KEY),
+		model: parseCodexConfigToml(configText).top.model,
+		baseUrl: configBaseUrl,
+	};
 }
 
-function decodeCcSwitchConfigText(raw: string): string {
-	return raw
-		.replace(/\\n/g, "\n")
-		.replace(/\\r/g, "\r")
-		.replace(/\\t/g, "\t")
-		.replace(/\\"/g, '"')
-		.replace(/\\\\/g, "\\");
-}
+/**
+ * 优先从 cc-switch 的当前 providers 表读取 Codex Provider。
+ *
+ * 不能把 cc-switch.db 当普通文本扫描：SQLite 的空闲页会保留已删除/旧版本记录，
+ * 文本扫描可能命中旧 API Key，造成自动摘要与手动切换使用不同凭据。
+ * Node 22.19+ 自带 node:sqlite，使用只读连接查询当前表数据，避免新增原生依赖。
+ * 不支持 Node 20 的原始文件扫描回退，避免误读 SQLite 历史页中的旧凭据。
+ */
+function readCurrentCodexProviderRecords(providerId?: string): CodexSummaryProviderRecord[] {
+	const dbPath = join(homedir(), ".cc-switch", "cc-switch.db");
+	if (!existsSync(dbPath)) return [];
 
-function findCodexProviderInCcSwitchDb(baseUrl: string): { apiKey?: string; model?: string } | undefined {
-	const dbText = readCcSwitchDbText();
-	if (!dbText) return undefined;
-	const target = normalizeUrlForCompare(baseUrl);
-	const pattern = /\{"auth":\{"OPENAI_API_KEY":"([^"]+)"\},"config":"([\s\S]{0,4000}?)"\}https?:\/\//g;
-	let match: RegExpExecArray | null;
-	while ((match = pattern.exec(dbText)) !== null) {
-		const configText = decodeCcSwitchConfigText(match[2]);
-		const configBaseUrl = extractCodexBaseUrlFromConfigText(configText);
-		if (!configBaseUrl || normalizeUrlForCompare(configBaseUrl) !== target) continue;
-		const parsed = parseCodexConfigToml(configText);
-		return {
-			apiKey: match[1],
-			model: parsed.top.model,
-		};
+	let DatabaseSync: SqliteDatabaseSyncConstructor;
+	try {
+		DatabaseSync = (requireForExtension("node:sqlite") as { DatabaseSync: SqliteDatabaseSyncConstructor }).DatabaseSync;
+	} catch (error) {
+		if (error instanceof Error && (error as NodeJS.ErrnoException).code === "ERR_UNKNOWN_BUILTIN_MODULE") {
+			throw new Error("读取当前 cc-switch Provider 需要 Node 22.19+ 的 node:sqlite；请升级 Node 后重启 Pi。");
+		}
+		throw error;
 	}
-	return undefined;
+
+	const database = new DatabaseSync(dbPath, { readOnly: true });
+	try {
+		const query = providerId
+			? database.prepare("SELECT id, settings_config FROM providers WHERE app_type = 'codex' AND id = ?")
+			: database.prepare("SELECT id, settings_config FROM providers WHERE app_type = 'codex'");
+		const rows = (providerId ? query.all(providerId) : query.all()) as CcSwitchProviderRow[];
+		return rows.map(parseCcSwitchProviderRow).filter(
+			(record): record is CodexSummaryProviderRecord => record !== undefined,
+		);
+	} finally {
+		database.close();
+	}
+}
+
+function findCodexProviderInCcSwitchDb(
+	baseUrl: string,
+	providerId?: string,
+): { apiKey?: string; model?: string; providerId?: string } | undefined {
+	let records: CodexSummaryProviderRecord[];
+	try {
+		records = readCurrentCodexProviderRecords(providerId) ?? [];
+	} catch (error) {
+		throw new Error(
+			`无法读取 cc-switch 当前 Codex Provider：${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+
+	const target = normalizeUrlForCompare(baseUrl);
+	const candidates = records.filter((record) => normalizeUrlForCompare(record.baseUrl) === target);
+	if (providerId) {
+		const exact = candidates.find((candidate) => candidate.providerId === providerId);
+		if (!exact) {
+			throw new Error(
+				`独立压缩 Provider 不匹配：未找到 ID=${providerId} 且 base_url=${baseUrl} 的当前 Codex Provider。请更新 codexSummary.providerId。`,
+			);
+		}
+		return exact;
+	}
+	if (candidates.length > 1) {
+		throw new Error(
+			`独立压缩 Provider 不唯一：base_url=${baseUrl} 匹配到 ${candidates.length} 条当前记录。请在 codexSummary.providerId 中指定 Provider ID。`,
+		);
+	}
+	return candidates[0];
 }
 
 function ccSwitchProviderConfigPath(): string {
@@ -1565,31 +1648,37 @@ function validateCodexSummaryBaseUrl(baseUrl: string): string {
 	}
 }
 
-function codexSummaryBaseUrlConfig(): Pick<CodexSummaryRoute, "baseUrl" | "source"> {
+function codexSummaryBaseUrlConfig(): Pick<CodexSummaryRoute, "baseUrl" | "providerId" | "source"> {
 	const envBaseUrl = process.env[CODEX_SUMMARY_BASE_URL_ENV]?.trim();
 	if (envBaseUrl) return { baseUrl: validateCodexSummaryBaseUrl(envBaseUrl), source: "env" };
 
-	const fileBaseUrl = readCcSwitchProviderLocalConfig(ccSwitchProviderConfigPath()).codexSummary?.baseUrl;
-	if (fileBaseUrl) return { baseUrl: validateCodexSummaryBaseUrl(fileBaseUrl), source: "config" };
+	const localConfig = readCcSwitchProviderLocalConfig(ccSwitchProviderConfigPath()).codexSummary;
+	if (localConfig?.baseUrl) {
+		return {
+			baseUrl: validateCodexSummaryBaseUrl(localConfig.baseUrl),
+			providerId: localConfig.providerId,
+			source: "config",
+		};
+	}
 
 	return { baseUrl: DEFAULT_CODEX_SUMMARY_BASE_URL, source: "default" };
 }
 
 function resolveIndependentCodexSummaryRoute(): CodexSummaryRoute {
-	const { baseUrl, source } = codexSummaryBaseUrlConfig();
+	const { baseUrl, providerId, source } = codexSummaryBaseUrlConfig();
 	if (isFcappAdmissionRetryEndpoint(baseUrl)) {
 		throw new Error(`独立压缩中转不能指向不支持压缩的 FC 地址：${baseUrl}`);
 	}
 
-	const provider = findCodexProviderInCcSwitchDb(baseUrl);
+	const provider = findCodexProviderInCcSwitchDb(baseUrl, providerId);
 	const model = process.env[CODEX_SUMMARY_MODEL_ENV]?.trim() || provider?.model;
 	const apiKey = process.env[CODEX_SUMMARY_API_KEY_ENV]?.trim() || provider?.apiKey;
 	if (!model || !apiKey) {
 		throw new Error(
-			`未找到独立压缩中转配置：${baseUrl}。请在 cc-switch 中添加 base_url 完全相同且包含模型和 API Key 的 Codex Provider，或设置 ${CODEX_SUMMARY_MODEL_ENV} 与 ${CODEX_SUMMARY_API_KEY_ENV}。`,
+			`未找到独立压缩中转配置：${baseUrl}。请在 cc-switch 中添加唯一的 Codex Provider，或在 codexSummary.providerId 中指定 Provider ID；也可以设置 ${CODEX_SUMMARY_MODEL_ENV} 与 ${CODEX_SUMMARY_API_KEY_ENV}。`,
 		);
 	}
-	return { baseUrl, apiKey, model, source };
+	return { baseUrl, apiKey, model, providerId: provider?.providerId ?? providerId, source };
 }
 
 function codexSummaryRouteStatus(codex: CodexConfig): string {
@@ -1599,7 +1688,8 @@ function codexSummaryRouteStatus(codex: CodexConfig): string {
 	try {
 		const route = resolveIndependentCodexSummaryRoute();
 		const sourceLabel = route.source === "env" ? "环境变量" : route.source === "config" ? "配置文件" : "默认配置";
-		return `Codex Summary: ${route.model} -> ${route.baseUrl} [独立压缩/${sourceLabel}]`;
+		const providerLabel = route.providerId ? `; provider=${route.providerId}` : "";
+		return `Codex Summary: ${route.model} -> ${route.baseUrl}${providerLabel} [独立压缩/${sourceLabel}]`;
 	} catch (error) {
 		return `Codex Summary: 配置错误 ${error instanceof Error ? error.message : String(error)}`;
 	}
