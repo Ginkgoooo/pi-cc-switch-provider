@@ -152,12 +152,12 @@ test("catalog discovery never reads an unowned pointer and reports safe fallback
 test("a valid catalog replaces legacy fixed entries while an empty catalog preserves fallback", () => {
 	const catalogModels = parseCodexModelCatalog(catalogText([{ slug: "kimi-k2" }, { slug: "glm-5" }])) ?? [];
 	assert.deepEqual(
-		buildCodexModelIds("kimi-k2", catalogModels, ["gpt-5.5", "gpt-5.6-sol", "gpt-6-astra"]),
+		buildCodexModelIds("kimi-k2", catalogModels, ["gpt-5.5", "gpt-5.6-sol", "gpt-6-astra", "deepseek-v4-flash"]),
 		["current", "kimi-k2", "glm-5"],
 	);
 	assert.deepEqual(
-		buildCodexModelIds("custom-current", [], ["gpt-5.5", "gpt-5.6-sol", "gpt-6-astra"]),
-		["current", "custom-current", "gpt-5.5", "gpt-5.6-sol", "gpt-6-astra"],
+		buildCodexModelIds("custom-current", [], ["gpt-5.5", "gpt-5.6-sol", "gpt-6-astra", "deepseek-v4-flash"]),
+		["current", "custom-current", "gpt-5.5", "gpt-5.6-sol", "gpt-6-astra", "deepseek-v4-flash"],
 	);
 });
 
