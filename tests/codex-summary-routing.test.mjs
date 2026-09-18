@@ -25,5 +25,5 @@ test("does not divert unrelated or lookalike routes", () => {
 	assert.equal(requiresIndependentCodexSummaryRoute("http://agentrouter.org/v1"), false);
 	assert.equal(requiresIndependentCodexSummaryRoute("https://api.agentrouter.org/v1"), false);
 	assert.equal(requiresIndependentCodexSummaryRoute("https://agentrouter.org.evil.example/v1"), false);
-	assert.equal(requiresIndependentCodexSummaryRoute("https://superapi.buzz/v1"), false);
+	assert.equal(requiresIndependentCodexSummaryRoute("https://ai.codeapx.com/codex/"), false);
 });
