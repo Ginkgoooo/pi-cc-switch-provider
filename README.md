@@ -263,7 +263,7 @@ To add extra fixed models, set `PI_CC_SWITCH_CLAUDE_MODELS` in cc-switch's Claud
 
 The extension registers `cc-switch-codex/current`. In `live` routing mode Responses requests re-read the active Codex configuration before each request and follow the current cc-switch route, credential, model, and reasoning effort; in `fixed` mode they use the snapshot captured at extension load.
 
-At startup or `/reload`, when the top-level `model_catalog_json` points to the CC Switch-owned filename `cc-switch-model-catalog.json`, the extension imports the catalog's validated model IDs, display names, context windows, reasoning flag, and input modalities. A valid non-empty catalog replaces the fixed Codex list. If the pointer is absent, user-owned, missing, oversized, malformed, or empty, the extension preserves the legacy fallback: the concrete current model plus `gpt-5.5`, `gpt-5.6-sol`, `gpt-6-astra`, and `deepseek-v4-flash`.
+At startup or `/reload`, when the top-level `model_catalog_json` points to the CC Switch-owned filename `cc-switch-model-catalog.json`, the extension imports the catalog's validated model IDs, display names, context windows, reasoning flag, and input modalities. A valid non-empty catalog replaces the fixed Codex list. If the pointer is absent, user-owned, missing, oversized, malformed, or empty, the extension preserves the legacy fallback: the concrete current model plus `gpt-5.5`, `gpt-5.6-sol`, `gpt-6-astra`, `deepseek-v4-flash`, and `glm-5.3`.
 
 Only the `current` alias follows later live model changes. Selecting a concrete catalog model sends that selected model ID. Catalog context windows are capped by `PI_CC_SWITCH_CODEX_CONTEXT_WINDOW` (258,400 by default), and the importer ignores every catalog field outside its metadata allowlist. Restart Pi or run `/reload` after CC Switch changes the catalog.
 
@@ -585,7 +585,7 @@ $env:NODE_USE_ENV_PROXY = "1"
 
 该扩展会注册 `cc-switch-codex/current`。在 `live` 模式下，Responses 请求会在每次调用前读取 Codex 当前配置，跟随 cc-switch 当前中转、凭据、模型和 reasoning effort；在 `fixed` 模式下，则使用扩展加载时捕获的快照。
 
-启动或执行 `/reload` 时，如果顶层 `model_catalog_json` 指向 CC Switch 所有的文件名 `cc-switch-model-catalog.json`，扩展会导入 catalog 中通过校验的模型 ID、显示名、上下文窗口、reasoning 标记和输入模态。有效且非空的 catalog 会替代固定 Codex 列表；如果指针缺失、属于用户自定义文件、文件不存在、过大、格式错误或为空，则保留旧回退列表：当前具体模型以及 `gpt-5.5`、`gpt-5.6-sol`、`gpt-6-astra`、`deepseek-v4-flash`。
+启动或执行 `/reload` 时，如果顶层 `model_catalog_json` 指向 CC Switch 所有的文件名 `cc-switch-model-catalog.json`，扩展会导入 catalog 中通过校验的模型 ID、显示名、上下文窗口、reasoning 标记和输入模态。有效且非空的 catalog 会替代固定 Codex 列表；如果指针缺失、属于用户自定义文件、文件不存在、过大、格式错误或为空，则保留旧回退列表：当前具体模型以及 `gpt-5.5`、`gpt-5.6-sol`、`gpt-6-astra`、`deepseek-v4-flash`、`glm-5.3`。
 
 只有 `current` alias 会继续跟随之后的 live 模型变化；选择 catalog 中的具体模型时，请求会保留该模型 ID。catalog 上下文仍受 `PI_CC_SWITCH_CODEX_CONTEXT_WINDOW` 限制（默认 258,400），导入器会忽略元数据白名单之外的全部字段。CC Switch 修改 catalog 后，需要重启 Pi 或执行 `/reload`。
 
