@@ -77,6 +77,32 @@ type CompatPiAi = typeof piAi & {
 
 const { registerApiProvider } = piAi as CompatPiAi;
 
+/**
+ * Pi 0.86 moved provider input to TranscriptContext. The prompt and active
+ * tools now live in system transcript entries instead of top-level fields.
+ * Keep the fallback for older Pi releases so the extension can be upgraded
+ * independently from the host.
+ */
+function transcriptSystemPrompt(context: Context): string {
+	const maybeTranscript = piAi as typeof piAi & {
+		getCurrentSystemPrompt?: (messages: readonly { role: string }[]) => string;
+	};
+	if (typeof maybeTranscript.getCurrentSystemPrompt === "function" && Array.isArray((context as { messages?: unknown }).messages)) {
+		return maybeTranscript.getCurrentSystemPrompt((context as { messages: readonly { role: string }[] }).messages);
+	}
+	return (context as Context & { systemPrompt?: string }).systemPrompt ?? "";
+}
+
+function transcriptTools(context: Context): Tool[] {
+	const maybeTranscript = piAi as typeof piAi & {
+		getCurrentTools?: (messages: readonly { role: string }[]) => Tool[];
+	};
+	if (typeof maybeTranscript.getCurrentTools === "function" && Array.isArray((context as { messages?: unknown }).messages)) {
+		return maybeTranscript.getCurrentTools((context as { messages: readonly { role: string }[] }).messages);
+	}
+	return (context as Context & { tools?: Tool[] }).tools ?? [];
+}
+
 type AuthKind = "api-key" | "bearer";
 
 interface ClaudeConfig {
@@ -1064,11 +1090,11 @@ function ccSwitchCompactionTriggerTokens(contextWindow: number, provider: string
 }
 
 function isSummarizationContext(context: Context): boolean {
-	return /context summarization assistant/i.test(context.systemPrompt ?? "");
+	return /context summarization assistant/i.test(transcriptSystemPrompt(context));
 }
 
 function isTaskContinuationAssessmentContext(context: Context): boolean {
-	return /task-continuation classifier/i.test(context.systemPrompt ?? "");
+	return /task-continuation classifier/i.test(transcriptSystemPrompt(context));
 }
 
 function stringContent(value: unknown): string | undefined {
@@ -2372,11 +2398,12 @@ function buildAnthropicPayload(
 	// system block 挂 ephemeral cache_control —— 200K 模型同样支持 prompt caching，
 	// 不缓存会让长会话每轮重复计费。
 	const systemBlocks: Record<string, unknown>[] = [];
-	if (context.systemPrompt) {
+	const systemPrompt = transcriptSystemPrompt(context);
+	if (systemPrompt) {
 		systemBlocks.push({
 			type: "text",
 			// 先做指纹改写再发送：pi 默认提示词的特征句会被中转拦截（429），见 maskPiPromptFingerprint 注释
-			text: maskPiPromptFingerprint(sanitizeText(context.systemPrompt)),
+			text: maskPiPromptFingerprint(sanitizeText(systemPrompt)),
 			cache_control: { type: "ephemeral" },
 		});
 	}
@@ -2384,7 +2411,7 @@ function buildAnthropicPayload(
 		payload.system = systemBlocks;
 	}
 
-	const tools = convertTools(context.tools);
+	const tools = convertTools(transcriptTools(context));
 	if (tools) {
 		payload.tools = tools;
 	}
@@ -2669,13 +2696,13 @@ function shouldReplayResponsesReasoning(model: Model<Api>): boolean {
 	return !isTokenworkResponsesProxy(model.baseUrl);
 }
 
-function convertResponsesMessages(model: Model<Api>, context: Context): Record<string, unknown>[] {
+function convertResponsesMessages(model: Model<Api>, context: Context, systemPrompt = transcriptSystemPrompt(context)): Record<string, unknown>[] {
 	const messages: Record<string, unknown>[] = [];
 
-	if (context.systemPrompt) {
+	if (systemPrompt) {
 		messages.push({
 			role: model.reasoning ? "developer" : "system",
-			content: sanitizeText(context.systemPrompt),
+			content: sanitizeText(systemPrompt),
 		});
 	}
 
@@ -2795,17 +2822,12 @@ function buildOpenAIResponsesPayload(
 	const summarizationInstructions = taskContinuationAssessment
 		? "You are a task-continuation classifier. Produce only the single status token requested by the input."
 		: "You are Codex, a coding agent. Produce only the requested structured context summary.";
-	const payloadContext: Context = summarizationContext
-		? {
-			...context,
-			// Codex Responses 官方形态使用顶层 instructions，input 中不放 developer/system 项。
-			systemPrompt: undefined,
-			tools: [],
-		}
-		: context;
+	// Codex Responses 官方形态使用顶层 instructions，input 中不放 developer/system 项。
+	const payloadSystemPrompt = summarizationContext ? "" : transcriptSystemPrompt(context);
+	const payloadTools = summarizationContext ? [] : transcriptTools(context);
 	const payload: Record<string, unknown> = {
 		model: model.id,
-		input: convertResponsesMessages(model, payloadContext),
+		input: convertResponsesMessages(model, context, payloadSystemPrompt),
 		stream: true,
 	};
 	if (summarizationContext) {
@@ -2833,8 +2855,12 @@ function buildOpenAIResponsesPayload(
 	if (options?.maxTokens) payload.max_output_tokens = options.maxTokens;
 	if (options?.temperature !== undefined) payload.temperature = options.temperature;
 
-	const tools = convertResponsesTools(payloadContext.tools);
+	const tools = convertResponsesTools(payloadTools);
 	if (tools) payload.tools = tools;
+	if (tools) {
+		payload.tool_choice = "auto";
+		payload.parallel_tool_calls = true;
+	}
 
 	// Pi compaction/branch-summary requests are recovery paths. Keep them plain text-only
 	// even when the active chat uses reasoning, otherwise some cc-switch Codex

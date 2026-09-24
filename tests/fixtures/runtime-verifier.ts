@@ -40,6 +40,7 @@ globalThis.fetch = async (url, init = {}) => {
 		model: payload?.model,
 		authorization: headers.get("authorization"),
 		xApiKey: headers.get("x-api-key"),
+		tools: Array.isArray(payload?.tools) ? payload.tools.map((tool) => tool?.name) : [],
 	});
 	return new Response(String(url).includes("claude") ? CLAUDE_SSE : CODEX_SSE, {
 		status: 200,
@@ -58,7 +59,28 @@ export default function (pi) {
 			const claude = ctx.modelRegistry.find("cc-switch-claude", "current");
 			const codex = ctx.modelRegistry.find("cc-switch-codex", "current");
 			if (!claude || !codex) throw new Error("cc-switch models missing from ModelRuntime");
-			const context = { messages: [{ role: "user", content: "verify", timestamp: Date.now() }] };
+			// Pi 0.86+ passes TranscriptContext: prompt and tools are carried by
+			// the leading system message instead of top-level context fields.
+			const context = {
+				messages: [
+					{
+						role: "system",
+						content: "verify system",
+						toolsAdded: [{
+							name: "bash",
+							description: "Execute a shell command.",
+							parameters: {
+								type: "object",
+								properties: { command: { type: "string" } },
+								required: ["command"],
+								additionalProperties: false,
+							},
+						}],
+						timestamp: 0,
+					},
+					{ role: "user", content: "verify", timestamp: Date.now() },
+				],
+			};
 			const claudeResult = await streamSimple(claude, context).result();
 			const codexResult = await streamSimple(codex, context).result();
 			ctx.ui.notify(JSON.stringify({

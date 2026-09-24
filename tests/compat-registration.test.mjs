@@ -45,12 +45,14 @@ function expectedRequests(label = "initial") {
 			model: `claude${suffix}-model`,
 			authorization: `Bearer claude${suffix}-key`,
 			xApiKey: null,
+			tools: ["Bash"],
 		},
 		{
 			url: `https://codex${suffix}.test/v1/responses`,
 			model: `gpt${suffix}`,
 			authorization: `Bearer codex${suffix}-key`,
 			xApiKey: null,
+			tools: ["bash"],
 		},
 	];
 }
