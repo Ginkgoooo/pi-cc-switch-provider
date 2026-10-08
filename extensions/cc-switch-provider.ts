@@ -212,6 +212,7 @@ const UPSTREAM_RETRY_MAX_ATTEMPTS_ENV = "PI_CC_SWITCH_UPSTREAM_RETRY_ATTEMPTS";
 const UPSTREAM_RETRY_BASE_DELAY_MS = 500;
 const UPSTREAM_RETRY_MAX_DELAY_MS = 15000;
 const UPSTREAM_RETRY_AFTER_MAX_MS = 30000;
+const CODEX_RATE_LIMIT_RETRY_MAX_DELAY_MS = 30000;
 const FCAPP_KEEPWARM_ENABLED_ENV = "PI_CC_SWITCH_FCAPP_KEEPWARM";
 const FCAPP_KEEPWARM_MODE_ENV = "PI_CC_SWITCH_FCAPP_KEEPWARM_MODE";
 const FCAPP_KEEPWARM_INTERVAL_ENV = "PI_CC_SWITCH_FCAPP_KEEPWARM_INTERVAL_MS";
@@ -488,6 +489,13 @@ function upstreamRetryDelayMs(attempt: number): number {
 	const baseDelay = Math.min(UPSTREAM_RETRY_MAX_DELAY_MS, UPSTREAM_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1));
 	const jitter = 0.85 + Math.random() * 0.3;
 	return Math.min(UPSTREAM_RETRY_MAX_DELAY_MS, Math.round(baseDelay * jitter));
+}
+
+function codexRateLimitRetryDelayMs(attempt: number): number {
+	const exponent = Math.min(attempt - 1, 6);
+	const baseDelay = Math.min(CODEX_RATE_LIMIT_RETRY_MAX_DELAY_MS, UPSTREAM_RETRY_BASE_DELAY_MS * 2 ** exponent);
+	const jitter = 0.85 + Math.random() * 0.3;
+	return Math.min(CODEX_RATE_LIMIT_RETRY_MAX_DELAY_MS, Math.round(baseDelay * jitter));
 }
 
 /**
@@ -2913,6 +2921,8 @@ function findOrCreateResponsesTextBlock(
 	return { block, contentIndex: output.content.length - 1 };
 }
 
+class CodexSseRateLimitError extends Error {}
+
 function handleResponsesEvent(
 	event: Record<string, unknown>,
 	output: AssistantMessage,
@@ -3056,6 +3066,9 @@ function handleResponsesEvent(
 		const error = isRecord(event.response.error) ? event.response.error : undefined;
 		const errorCode = error ? stringValue(error.code) ?? "unknown" : "response.failed";
 		const errorMsg = error ? stringValue(error.message) ?? "no message" : "response.failed";
+		if (errorCode === "rate_limit_exceeded") {
+			throw new CodexSseRateLimitError(`cc-switch Codex error: ${errorCode}: ${errorMsg}`);
+		}
 		// 记录详细的错误日志，方便调试
 		console.error('[cc-switch Codex Error]', JSON.stringify({
 			type: 'response.failed',
@@ -3072,6 +3085,9 @@ function handleResponsesEvent(
 		const nestedError = isRecord(event.error) ? event.error : undefined;
 		const errorCode = stringValue(nestedError?.code) ?? stringValue(event.code) ?? "error";
 		const errorMsg = stringValue(nestedError?.message) ?? stringValue(event.message) ?? "unknown error";
+		if (errorCode === "rate_limit_exceeded") {
+			throw new CodexSseRateLimitError(`cc-switch Codex error: ${errorCode}: ${errorMsg}`);
+		}
 		// 记录详细的错误日志，方便调试
 		console.error('[cc-switch Codex Error]', JSON.stringify({
 			type: 'sse_error',
@@ -3100,24 +3116,29 @@ async function processOpenAIResponsesSse(
 	const state: { currentContentIndex?: number; currentItem?: Record<string, unknown> } = {};
 	let buffer = "";
 
-	while (true) {
-		const { done, value } = await reader.read();
-		if (done) break;
-		buffer += decoder.decode(value, { stream: true });
-		const parsed = parseSseChunk(buffer);
-		buffer = parsed.rest;
-		for (const sse of parsed.events) {
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			buffer += decoder.decode(value, { stream: true });
+			const parsed = parseSseChunk(buffer);
+			buffer = parsed.rest;
+			for (const sse of parsed.events) {
+				if (sse.data === "[DONE]") continue;
+				const event = JSON.parse(sse.data) as unknown;
+				if (isRecord(event)) handleResponsesEvent(event, output, stream, model, state);
+			}
+		}
+
+		const finalParsed = parseSseChunk(buffer + decoder.decode());
+		for (const sse of finalParsed.events) {
 			if (sse.data === "[DONE]") continue;
 			const event = JSON.parse(sse.data) as unknown;
 			if (isRecord(event)) handleResponsesEvent(event, output, stream, model, state);
 		}
-	}
-
-	const finalParsed = parseSseChunk(buffer + decoder.decode());
-	for (const sse of finalParsed.events) {
-		if (sse.data === "[DONE]") continue;
-		const event = JSON.parse(sse.data) as unknown;
-		if (isRecord(event)) handleResponsesEvent(event, output, stream, model, state);
+	} finally {
+		await reader.cancel().catch(() => undefined);
+		reader.releaseLock();
 	}
 }
 
@@ -3184,25 +3205,59 @@ function streamCcSwitchCodexResponses(
 			const endpoint = endpointForOpenAIResponses(requestBaseUrl);
 			const route = summaryRoute ? "independent-summary" : "primary";
 			writeDebugRequest(headers, payload, context, { route, endpoint, primaryEndpoint: summaryRoute ? endpointForOpenAIResponses(runtimeModel.baseUrl) : undefined });
-			const response = await fetchWithUpstreamRetry(endpoint, {
+			const requestInit: RequestInit = {
 				method: "POST",
 				headers,
 				body: JSON.stringify(payload),
 				signal: options?.signal,
-			}, summaryRoute ? "Codex summary" : "Codex");
-
-			if (!response.ok) {
-				const errorText = await response.text();
-				const requestKind = summaryRoute ? "summary request" : "request";
-				throw new Error(`cc-switch Codex ${requestKind} failed: ${response.status} ${errorText} (${endpoint})`);
+			};
+			let rateLimitAttempts = 0;
+			let started = false;
+			while (true) {
+				if (options?.signal?.aborted) throw new Error("Request was aborted");
+				const response = await fetchWithUpstreamRetry(endpoint, requestInit, summaryRoute ? "Codex summary" : "Codex");
+				if (response.status === 429) {
+					const errorText = await safeResponseText(response);
+					if (isNonRetryableFailure(response.status, errorText)) {
+						const requestKind = summaryRoute ? "summary request" : "request";
+						throw new Error(`cc-switch Codex ${requestKind} failed: 429 ${errorText} (${endpoint})`);
+					}
+					rateLimitAttempts += 1;
+					const delayMs = parseRetryAfterMs(response) ?? codexRateLimitRetryDelayMs(rateLimitAttempts);
+					if (shouldLogFcappAdmissionRetry(rateLimitAttempts)) {
+						console.warn(`[cc-switch Codex] rate limit retry #${rateLimitAttempts}: HTTP 429; retrying in ${delayMs}ms. ${errorText.slice(0, 200)}`);
+					}
+					await abortableDelay(delayMs, options?.signal);
+					continue;
+				}
+				if (!response.ok) {
+					const errorText = await response.text();
+					const requestKind = summaryRoute ? "summary request" : "request";
+					throw new Error(`cc-switch Codex ${requestKind} failed: ${response.status} ${errorText} (${endpoint})`);
+				}
+				if (!response.body) {
+					throw new Error(`cc-switch Codex${summaryRoute ? " summary" : ""} response did not include a stream body`);
+				}
+				startFcappKeepwarm(endpoint, "Codex", requestApiKey, requestModelId, true);
+				if (!started) {
+					stream.push({ type: "start", partial: output });
+					started = true;
+				}
+				try {
+					await processOpenAIResponsesSse(response, output, stream, runtimeModel);
+					break;
+				} catch (error) {
+					// 已输出内容块时不重放请求，避免重复文本或重复执行工具调用。
+					if (!(error instanceof CodexSseRateLimitError) || output.content.length > 0 || options?.signal?.aborted) throw error;
+					output.responseId = undefined;
+					rateLimitAttempts += 1;
+					const delayMs = codexRateLimitRetryDelayMs(rateLimitAttempts);
+					if (shouldLogFcappAdmissionRetry(rateLimitAttempts)) {
+						console.warn(`[cc-switch Codex] SSE rate limit retry #${rateLimitAttempts}: ${error.message}; retrying in ${delayMs}ms.`);
+					}
+					await abortableDelay(delayMs, options?.signal);
+				}
 			}
-			if (!response.body) {
-				throw new Error(`cc-switch Codex${summaryRoute ? " summary" : ""} response did not include a stream body`);
-			}
-			startFcappKeepwarm(endpoint, "Codex", requestApiKey, requestModelId, true);
-
-			stream.push({ type: "start", partial: output });
-			await processOpenAIResponsesSse(response, output, stream, runtimeModel);
 			if (options?.signal?.aborted) throw new Error("Request was aborted");
 			stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
 			stream.end();
