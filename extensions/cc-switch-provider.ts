@@ -191,6 +191,10 @@ const DEFAULT_CLAUDE_MODELS = [
 	"claude-sonnet-4-6",
 ] as const;
 const CONTEXT_1M_BETA = "context-1m-2025-08-07";
+// 中转客户端校验用的身份文案：anyrouter.top 一类 new-api 中转对 /v1/messages 做「仅限 Claude Code
+// 客户端」校验，只认 system 数组第一块里的身份句；实测（2026-10-14）首块放 pi 自己的提示词会被
+// 秒拒（503 Service Unavailable / 408 空响应），首块放这句身份文案、pi 提示词跟在其后则正常放行。
+const CLAUDE_CODE_IDENTITY_TEXT = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 const CLAUDE_CODE_BETAS = [
 	"claude-code-20250219",
 	CONTEXT_1M_BETA,
@@ -2406,6 +2410,13 @@ function buildAnthropicPayload(
 	// system block 挂 ephemeral cache_control —— 200K 模型同样支持 prompt caching，
 	// 不缓存会让长会话每轮重复计费。
 	const systemBlocks: Record<string, unknown>[] = [];
+	// 首块必须是 Claude Code 身份文案，详见 CLAUDE_CODE_IDENTITY_TEXT 注释；
+	// 顺序不能动：身份句在前才放行，放到身份句之后或塞进同一块都会被拒。
+	systemBlocks.push({
+		type: "text",
+		text: CLAUDE_CODE_IDENTITY_TEXT,
+		cache_control: { type: "ephemeral" },
+	});
 	const systemPrompt = transcriptSystemPrompt(context);
 	if (systemPrompt) {
 		systemBlocks.push({
@@ -2415,9 +2426,7 @@ function buildAnthropicPayload(
 			cache_control: { type: "ephemeral" },
 		});
 	}
-	if (systemBlocks.length > 0) {
-		payload.system = systemBlocks;
-	}
+	payload.system = systemBlocks;
 
 	const tools = convertTools(transcriptTools(context));
 	if (tools) {
@@ -2434,12 +2443,22 @@ function buildAnthropicPayload(
 			const effort = effortForReasoning(reasoning);
 			if (effort) payload.output_config = { effort };
 		}
-		// user_id 只发单个稳定哈希，不要拼成 Claude Code 的完整身份信封。
-		// 实测（2026-07-26，i.wqwlkj.cn）：user_id 里同时出现 device_id + account_uuid + session_id
-		// 三元组时，中转判定为非 CC 客户端伪造身份，稳定返回 429「Upstream rate limit exceeded」——
-		// 池子健康时对照 0/5 vs 5/5，与 device_id 取值、JSON 形状、长度、单个关键词都无关。
+		// anyrouter.top / agentrouter.org 这类中转会对 /v1/messages 做客户端校验，user_id 必须是
+		// Claude Code 的 JSON 身份信封；实测（2026-10-14，anyrouter.top）裸哈希被秒拒 503
+		// 「Service Unavailable」，换成 device_id + account_uuid + session_id 信封即 200。
+		// 但另一类中转（实测 2026-07-26，i.wqwlkj.cn）把三元组判定为伪造身份稳定返回 429
+		// 「Upstream rate limit exceeded」，所以按 host 分流，两侧各自保持既有可用行为。
+		const identityDeviceId = createHash("sha256").update(`${homedir()}:pi-cc-switch-provider`).digest("hex");
+		const requiresClaudeCodeIdentityEnvelope = isAnyrouterHttpsUrl(model.baseUrl)
+			|| isAgentrouterHttpsUrl(model.baseUrl);
 		payload.metadata = {
-			user_id: createHash("sha256").update(`${homedir()}:pi-cc-switch-provider`).digest("hex"),
+			user_id: requiresClaudeCodeIdentityEnvelope
+				? JSON.stringify({
+					device_id: identityDeviceId,
+					account_uuid: "",
+					session_id: sessionId,
+				})
+				: identityDeviceId,
 		};
 	} else {
 		const budget = thinkingBudget(reasoning, options);
