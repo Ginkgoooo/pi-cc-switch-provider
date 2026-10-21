@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -104,6 +104,17 @@ async function runCommand(id, message, expectNotification = true) {
 
 before(() => {
 	writeTestConfig();
+	// 首次启动即使用仅含 bearer token 的配置，验证 auth.json 并非注册前提。
+	rmSync(join(home, ".codex", "auth.json"));
+	writeFileSync(join(home, ".codex", "config.toml"), [
+		'model = "gpt"',
+		'model_provider = "test"',
+		"[model_providers.test]",
+		'base_url = "https://codex.test/v1"',
+		'wire_api = "responses"',
+		'requires_openai_auth = false',
+		'experimental_bearer_token = "codex-key"',
+	].join("\n"));
 	pi = spawn("pi", [
 		"--mode", "rpc",
 		"--offline",
@@ -174,4 +185,165 @@ test("compat dispatch and live/fixed routing survive real Pi reloads", async () 
 	assert.match(liveNotification.message, /已切换为实时跟随/);
 	const latest = JSON.parse((await runCommand("latest", "/verify-compat")).message);
 	assert.deepEqual(latest, { ...expectedBase, requests: expectedRequests("after-fixed") });
+});
+
+test("Codex credential precedence and missing credentials survive real Pi reloads", async (t) => {
+	const scenarios = [
+		{
+			name: "active provider token works without auth.json",
+			activeToken: "active-key",
+			expectedKey: "active-key",
+		},
+		{
+			name: "active provider token overrides top-level token and stale auth.json",
+			activeToken: "active-key",
+			topToken: "top-key",
+			authText: JSON.stringify({ OPENAI_API_KEY: "stale-key" }),
+			expectedKey: "active-key",
+		},
+		{
+			name: "blank active token falls back to top-level token",
+			activeToken: "   ",
+			topToken: "top-key",
+			expectedKey: "top-key",
+		},
+		{
+			name: "flat config token overrides auth.json",
+			flat: true,
+			topToken: "flat-key",
+			authText: JSON.stringify({ OPENAI_API_KEY: "stale-key" }),
+			expectedKey: "flat-key",
+		},
+		{
+			name: "active token works with malformed auth.json",
+			activeToken: "active-key",
+			authText: "{invalid",
+			expectedKey: "active-key",
+		},
+		{
+			name: "auth.json remains supported without configured tokens",
+			authText: JSON.stringify({ OPENAI_API_KEY: "legacy-key" }),
+			expectedKey: "legacy-key",
+		},
+		{
+			name: "blank tokens fall back to auth.json",
+			activeToken: "   ",
+			topToken: "   ",
+			authText: JSON.stringify({ OPENAI_API_KEY: "legacy-key" }),
+			expectedKey: "legacy-key",
+		},
+		{
+			name: "inactive provider token never overrides auth.json",
+			inactiveToken: "inactive-key",
+			authText: JSON.stringify({ OPENAI_API_KEY: "legacy-key" }),
+			expectedKey: "legacy-key",
+		},
+		{
+			name: "inactive provider token cannot register an unauthenticated active provider",
+			inactiveToken: "inactive-key",
+		},
+		{
+			name: "requires_openai_auth false alone is not a credential",
+		},
+		{
+			name: "blank credentials do not register Codex",
+			activeToken: "   ",
+			topToken: "   ",
+			authText: JSON.stringify({ OPENAI_API_KEY: "   " }),
+		},
+	];
+
+	for (const [index, scenario] of scenarios.entries()) {
+		await t.test(scenario.name, async () => {
+			const authPath = join(home, ".codex", "auth.json");
+			if (scenario.authText === undefined) rmSync(authPath, { force: true });
+			else writeFileSync(authPath, scenario.authText);
+			const config = ['model = "gpt-6.1-sol"'];
+			if (scenario.topToken !== undefined) {
+				config.push(`experimental_bearer_token = ${JSON.stringify(scenario.topToken)}`);
+			}
+			if (!scenario.flat) config.push('model_provider = "test"', "[model_providers.test]");
+			config.push(
+				'base_url = "https://codex-credentials.test/v1"',
+				'wire_api = "responses"',
+				"requires_openai_auth = false",
+			);
+			if (scenario.activeToken !== undefined) {
+				config.push(`experimental_bearer_token = ${JSON.stringify(scenario.activeToken)}`);
+			}
+			if (scenario.inactiveToken !== undefined) {
+				config.push("[model_providers.inactive]", `experimental_bearer_token = ${JSON.stringify(scenario.inactiveToken)}`);
+			}
+			writeFileSync(join(home, ".codex", "config.toml"), config.join("\n"));
+			await runCommand(`credential-reload-${index}`, "/verify-reload", false);
+
+			const registered = JSON.parse((await runCommand(`credential-registration-${index}`, "/verify-codex-registration")).message);
+			const expected = Boolean(scenario.expectedKey);
+			assert.equal(registered.compat, expected);
+			if (!expected) {
+				// Pi 的 reload 保留旧模型元数据；用新进程确认本次没有注册 Codex。
+				const listing = spawnSync("pi", [
+					"--offline", "--list-models", "cc-switch", "--extension", extensionPath,
+				], {
+					cwd: projectRoot,
+					env: { ...process.env, HOME: home, USERPROFILE: home, PI_CC_SWITCH_FCAPP_KEEPWARM: "0" },
+					encoding: "utf8",
+					shell: process.platform === "win32",
+					timeout: 10000,
+				});
+				assert.equal(listing.status, 0, listing.stderr);
+				assert.match(listing.stdout, /cc-switch-claude/);
+				assert.doesNotMatch(listing.stdout, /cc-switch-codex/);
+				const status = (await runCommand(`credential-status-${index}`, "/cc-switch")).message;
+				assert.match(status, /no credential: experimental_bearer_token/);
+				assert.match(status, /auth\.json missing a valid OPENAI_API_KEY/);
+				assert.doesNotMatch(status, /inactive-key/);
+				return;
+			}
+
+			assert.deepEqual(registered, { current: true, concrete: true, compat: true });
+			const result = JSON.parse((await runCommand(`credential-request-${index}`, "/verify-compat gpt-6.1-sol")).message);
+			assert.equal(result.modelRuntime.codex, "gpt-6.1-sol");
+			assert.equal(result.dispatch.codex, "codex-ok");
+			assert.deepEqual(result.requests[1], {
+				url: "https://codex-credentials.test/v1/responses",
+				model: "gpt-6.1-sol",
+				authorization: `Bearer ${scenario.expectedKey}`,
+				xApiKey: null,
+				tools: ["bash"],
+			});
+		});
+	}
+});
+
+test("bearer token changes follow live routing and remain captured in fixed mode", async () => {
+	function writeBearerConfig(token) {
+		writeFileSync(join(home, ".codex", "config.toml"), [
+			'model = "gpt-6.1-sol"',
+			'model_provider = "test"',
+			"[model_providers.test]",
+			'base_url = "https://codex-credentials.test/v1"',
+			'wire_api = "responses"',
+			`experimental_bearer_token = ${JSON.stringify(token)}`,
+		].join("\n"));
+	}
+	async function requestAuthorization(id) {
+		const result = JSON.parse((await runCommand(id, "/verify-compat")).message);
+		assert.equal(result.dispatch.codex, "codex-ok");
+		return result.requests[1].authorization;
+	}
+
+	rmSync(join(home, ".codex", "auth.json"), { force: true });
+	writeBearerConfig("initial-bearer");
+	await runCommand("bearer-reload", "/verify-reload", false);
+	assert.equal(await requestAuthorization("bearer-initial"), "Bearer initial-bearer");
+
+	writeBearerConfig("live-bearer");
+	assert.equal(await requestAuthorization("bearer-live"), "Bearer live-bearer");
+	await runCommand("bearer-fixed-mode", "/cc-switch fixed");
+	writeBearerConfig("after-fixed-bearer");
+	assert.equal(await requestAuthorization("bearer-fixed"), "Bearer live-bearer");
+
+	await runCommand("bearer-live-mode", "/cc-switch live");
+	assert.equal(await requestAuthorization("bearer-latest"), "Bearer after-fixed-bearer");
 });

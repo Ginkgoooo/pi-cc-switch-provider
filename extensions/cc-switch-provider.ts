@@ -1164,7 +1164,7 @@ function extractClaudeFromSettings(settings: Record<string, unknown>, env: Recor
 }
 
 function extractCodexFromConfigText(
-	apiKey: string,
+	readAuthApiKey: () => string | undefined,
 	configText: string,
 	configDirectory: string,
 ): ExtractResult<CodexConfig> {
@@ -1189,6 +1189,18 @@ function extractCodexFromConfigText(
 	}
 	if (!model) {
 		return { ok: false, error: "top-level 'model' missing" };
+	}
+
+	// 活动 provider 的显式 token 优先；仅在配置中没有有效 token 时读取旧 auth.json。
+	// 不扫描其他 provider，避免将非活动中转的凭据发送到当前地址。
+	const apiKey = stringValue(section?.experimental_bearer_token)
+		?? stringValue(toml.top.experimental_bearer_token)
+		?? readAuthApiKey();
+	if (!apiKey) {
+		return {
+			ok: false,
+			error: "no credential: experimental_bearer_token missing from active provider/top-level config and auth.json missing a valid OPENAI_API_KEY",
+		};
 	}
 
 	const catalog = loadOwnedCodexModelCatalog(toml.top.model_catalog_json, configDirectory, {
@@ -1738,16 +1750,6 @@ function loadCodexConfig(): CodexConfig | undefined {
 	const authPath = paths.codexAuthPath;
 	const configPath = paths.codexConfigPath;
 
-	if (!existsSync(authPath)) {
-		loadDiagnostics.codex = `Codex: auth.json not found at ${authPath}; skip provider registration`;
-		return undefined;
-	}
-	const auth = readJsonObject(authPath);
-	const apiKey = stringValue(auth?.OPENAI_API_KEY);
-	if (!apiKey) {
-		loadDiagnostics.codex = `Codex: auth.json missing OPENAI_API_KEY: ${authPath}`;
-		return undefined;
-	}
 	if (!existsSync(configPath)) {
 		loadDiagnostics.codex = `Codex: config.toml not found at ${configPath}`;
 		return undefined;
@@ -1761,7 +1763,11 @@ function loadCodexConfig(): CodexConfig | undefined {
 		return undefined;
 	}
 
-	const result = extractCodexFromConfigText(apiKey, configText, dirname(configPath));
+	const result = extractCodexFromConfigText(
+		() => stringValue(readJsonObject(authPath)?.OPENAI_API_KEY),
+		configText,
+		dirname(configPath),
+	);
 	if (!result.ok) {
 		loadDiagnostics.codex = `Codex: ${result.error} in ${configPath}`;
 		return undefined;

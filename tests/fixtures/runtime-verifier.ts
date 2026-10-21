@@ -55,9 +55,9 @@ function text(message) {
 export default function (pi) {
 	pi.registerCommand("verify-compat", {
 		description: "Observe ModelRuntime and compat dispatch",
-		async handler(_args, ctx) {
+		async handler(args, ctx) {
 			const claude = ctx.modelRegistry.find("cc-switch-claude", "current");
-			const codex = ctx.modelRegistry.find("cc-switch-codex", "current");
+			const codex = ctx.modelRegistry.find("cc-switch-codex", args.trim() || "current");
 			if (!claude || !codex) throw new Error("cc-switch models missing from ModelRuntime");
 			// Pi 0.86+ passes TranscriptContext: prompt and tools are carried by
 			// the leading system message instead of top-level context fields.
@@ -91,6 +91,17 @@ export default function (pi) {
 				},
 				dispatch: { claude: text(claudeResult), codex: text(codexResult) },
 				requests: requests.splice(0),
+			}), "info");
+		},
+	});
+
+	pi.registerCommand("verify-codex-registration", {
+		description: "Observe Codex registration without sending a request",
+		async handler(_args, ctx) {
+			ctx.ui.notify(JSON.stringify({
+				current: Boolean(ctx.modelRegistry.find("cc-switch-codex", "current")),
+				concrete: Boolean(ctx.modelRegistry.find("cc-switch-codex", "gpt-6.1-sol")),
+				compat: Boolean(getApiProvider("cc-switch-codex-responses")),
 			}), "info");
 		},
 	});
