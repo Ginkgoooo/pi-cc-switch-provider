@@ -277,7 +277,23 @@ When the effective model is `gpt-5.6-sol`, normal Responses requests use the top
 
 ### Codex Context and Compaction
 
-`cc-switch-codex` uses a default context window of 258,400 tokens. Early tool-chain compaction starts at 88% (227,392 tokens), leaving 31,008 tokens for continuation and recovery before the window is exhausted. Claude keeps its existing 85% default trigger.
+`cc-switch-codex` uses a default context window of 258,400 tokens. Compaction and tool-chain continuation now use Pi's native lifecycle. The extension no longer calls manual compaction from `turn_end` or injects a hidden continuation message, avoiding duplicate compaction and aborted continuations on Pi 0.87.1.
+
+To retain the previous Codex 88% trigger, merge exact model overrides into `~/.pi/agent/settings.json` or project `.pi/settings.json`:
+
+```json
+{
+  "compaction": {
+    "enabled": true,
+    "modelOverrides": {
+      "cc-switch-codex/current": { "reserveTokens": 31008 },
+      "cc-switch-codex/gpt-6.1-sol": { "reserveTokens": 31008 }
+    }
+  }
+}
+```
+
+Pi triggers above `contextWindow - reserveTokens`; 258,400 minus 31,008 equals 227,392 tokens. For other registered models, calculate `reserveTokens = contextWindow - floor(contextWindow * ratio)`, using 0.88 for Codex and 0.85 for Claude. Keys must match the selected `provider/modelId` exactly, including `current` when selecting that alias. Recalculate overrides when a catalog or context-window override changes a model's registered window. Preserve existing `keepRecentTokens` and unrelated settings; without matching overrides, Pi uses its ordinary compaction settings. The removed `PI_CC_SWITCH_EARLY_COMPACTION` and `PI_CC_SWITCH_COMPACTION_TRIGGER_*` environment variables no longer control compaction.
 
 Set `PI_CC_SWITCH_CODEX_CONTEXT_WINDOW` to override the value, for example:
 
@@ -597,7 +613,23 @@ Codex 凭据优先从 `config.toml` 读取：先取 `model_provider` 指向的�
 
 ### Codex 上下文与压缩
 
-`cc-switch-codex` 默认使用 258,400 token 上下文窗口。工具链提前压缩默认在 88%（227,392 token）触发，在耗尽窗口前保留 31,008 token 供任务续接和异常恢复；Claude 继续使用原有的 85% 默认触发比例。
+`cc-switch-codex` 默认使用 258,400 token 上下文窗口。压缩与工具链续跑现在统一交给 Pi 原生流程；扩展不再从 `turn_end` 发起手动压缩，也不再注入隐藏续跑消息，避免在 Pi 0.87.1 中重复压缩、意外中止任务。
+
+如需沿用原有 Codex 88% 提前压缩阈值，将以下模型级配置合并到 `~/.pi/agent/settings.json` 或项目 `.pi/settings.json`：
+
+```json
+{
+  "compaction": {
+    "enabled": true,
+    "modelOverrides": {
+      "cc-switch-codex/current": { "reserveTokens": 31008 },
+      "cc-switch-codex/gpt-6.1-sol": { "reserveTokens": 31008 }
+    }
+  }
+}
+```
+
+Pi 在超过 `contextWindow - reserveTokens` 时触发压缩；258,400 减去 31,008 即 227,392 token。其他注册模型按 `reserveTokens = contextWindow - floor(contextWindow * ratio)` 计算，Codex 使用 0.88，Claude 使用 0.85。键名必须精确匹配选中的 `provider/modelId`；使用 `current` 别名时也要配置对应键。catalog 或上下文覆盖值改变注册窗口后，需要重新计算对应预算。保留现有 `keepRecentTokens` 和无关设置；未配置匹配覆盖项时，使用 Pi 的普通压缩设置。已移除的 `PI_CC_SWITCH_EARLY_COMPACTION` 和 `PI_CC_SWITCH_COMPACTION_TRIGGER_*` 环境变量不再控制压缩。
 
 如需覆盖该值，可设置 `PI_CC_SWITCH_CODEX_CONTEXT_WINDOW`，例如：
 
