@@ -29,6 +29,18 @@ const requests = [];
 
 globalThis.fetch = async (url, init = {}) => {
 	const headers = new Headers(init.headers);
+	if (String(url).includes("codex") && (
+		!/^codex_cli_rs\/\d+\.\d+\.\d+ /.test(headers.get("user-agent") ?? "") ||
+		headers.get("originator") !== "codex_cli_rs" ||
+		!headers.get("session_id") ||
+		!headers.get("x-codex-window-id") ||
+		!headers.get("x-codex-installation-id")
+	)) {
+		return new Response(JSON.stringify({ error: {
+			message: "This account only allows Codex official clients",
+			type: "forbidden_error",
+		} }), { status: 403 });
+	}
 	let payload;
 	try {
 		payload = typeof init.body === "string" ? JSON.parse(init.body) : undefined;

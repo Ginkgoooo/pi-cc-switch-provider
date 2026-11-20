@@ -8,6 +8,7 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { fetch as undiciFetch, ProxyAgent } from "undici";
 
 import * as piAi from "@earendil-works/pi-ai";
+import { buildCodexClientHeaders } from "../lib/codex-client-headers.ts";
 import {
 	CLAUDE_CURRENT_MODEL_ENV,
 	resolveClaudeCurrentModel,
@@ -3182,11 +3183,7 @@ function streamCcSwitchCodexResponses(
 				: undefined;
 			const primaryPayload = buildOpenAIResponsesPayload(runtimeModel, context, options, runtimeReasoningEffort);
 			const payload = requestModelId === runtimeModel.id ? primaryPayload : { ...primaryPayload, model: requestModelId };
-			const headers: Record<string, string> = {
-				accept: "text/event-stream",
-				"content-type": "application/json",
-				authorization: `Bearer ${requestApiKey}`,
-			};
+			const headers = buildCodexClientHeaders(requestApiKey, options?.sessionId);
 
 			const endpoint = endpointForOpenAIResponses(requestBaseUrl);
 			const route = summaryRoute ? "independent-summary" : "primary";

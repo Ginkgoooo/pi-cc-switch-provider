@@ -18,7 +18,7 @@
   },
   "scripts": {
     "test": "node --experimental-strip-types --test tests/*.test.mjs",
-    "check": "node --experimental-strip-types --check lib/cc-switch-config-paths.ts && node --experimental-strip-types --check lib/claude-model-selection.ts && node --experimental-strip-types --check lib/codex-model-catalog.ts && node --experimental-strip-types --check lib/provider-local-config.ts && node --experimental-strip-types --check lib/selective-proxy.ts && node --experimental-strip-types --check extensions/cc-switch-provider.ts"
+    "check": "node --experimental-strip-types --check lib/cc-switch-config-paths.ts && node --experimental-strip-types --check lib/claude-model-selection.ts && node --experimental-strip-types --check lib/codex-client-headers.ts && node --experimental-strip-types --check lib/codex-model-catalog.ts && node --experimental-strip-types --check lib/provider-local-config.ts && node --experimental-strip-types --check lib/selective-proxy.ts && node --experimental-strip-types --check extensions/cc-switch-provider.ts"
   },
   "dependencies": {
     "undici": "^7.19.1"
