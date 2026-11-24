@@ -152,13 +152,23 @@ test("catalog discovery never reads an unowned pointer and reports safe fallback
 test("a valid catalog replaces legacy fixed entries while an empty catalog preserves fallback", () => {
 	const catalogModels = parseCodexModelCatalog(catalogText([{ slug: "kimi-k2" }, { slug: "glm-5" }])) ?? [];
 	assert.deepEqual(
-		buildCodexModelIds("kimi-k2", catalogModels, ["gpt-5.5", "gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "deepseek-v4-flash", "glm-5.3"]),
+		buildCodexModelIds("kimi-k2", catalogModels, ["gpt-5.5", "gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-astra", "gpt-6.2-sol", "deepseek-v4-flash", "glm-5.3"]),
 		["current", "kimi-k2", "glm-5"],
 	);
 	assert.deepEqual(
-		buildCodexModelIds("custom-current", [], ["gpt-5.5", "gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "deepseek-v4-flash", "glm-5.3"]),
-		["current", "custom-current", "gpt-5.5", "gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "deepseek-v4-flash", "glm-5.3"],
+		buildCodexModelIds("custom-current", [], ["gpt-5.5", "gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-astra", "gpt-6.2-sol", "deepseek-v4-flash", "glm-5.3"]),
+		["current", "custom-current", "gpt-5.5", "gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-astra", "gpt-6.2-sol", "deepseek-v4-flash", "glm-5.3"],
 	);
+});
+
+test("新增 GPT 6.2 模型作为当前模型时不重复注册，具体 ID 不跟随 live 切换", () => {
+	const models = ["gpt-6.2-astra", "gpt-6.2-sol"];
+	for (const model of models) {
+		const ids = buildCodexModelIds(model, [], models);
+		assert.equal(ids.filter((id) => id === model).length, 1);
+		assert.equal(resolveCodexRequestModelId("current", model), model);
+		assert.equal(resolveCodexRequestModelId(model, "gpt-6.1-sol"), model);
+	}
 });
 
 test("only the current alias follows the live model", () => {

@@ -187,6 +187,35 @@ test("compat dispatch and live/fixed routing survive real Pi reloads", async () 
 	assert.deepEqual(latest, { ...expectedBase, requests: expectedRequests("after-fixed") });
 });
 
+test("GPT 6.2 固定模型可在真实 Pi 中注册并透传，current 别名跟随 live 配置", async (t) => {
+	writeTestConfig();
+	await runCommand("gpt-6.2-reload", "/verify-reload", false);
+
+	for (const model of ["gpt-6.2-astra", "gpt-6.2-sol"]) {
+		await t.test(model, async () => {
+			// 配置仍选用其他模型，确认新增 ID 来自固定列表且不会被当前模型覆盖。
+			const concrete = JSON.parse((await runCommand(`${model}-concrete`, `/verify-compat ${model}`)).message);
+			assert.equal(concrete.modelRuntime.codex, model);
+			assert.equal(concrete.dispatch.codex, "codex-ok");
+			const expected = expectedRequests();
+			expected[1].model = model;
+			assert.deepEqual(concrete.requests, expected);
+
+			writeFileSync(join(home, ".codex", "config.toml"), [
+				`model = "${model}"`,
+				'model_provider = "test"',
+				"[model_providers.test]",
+				'base_url = "https://codex.test/v1"',
+				'wire_api = "responses"',
+			].join("\n"));
+			const current = JSON.parse((await runCommand(`${model}-current`, "/verify-compat")).message);
+			assert.equal(current.modelRuntime.codex, "current");
+			assert.equal(current.dispatch.codex, "codex-ok");
+			assert.deepEqual(current.requests, expected);
+		});
+	}
+});
+
 test("Codex credential precedence and missing credentials survive real Pi reloads", async (t) => {
 	const scenarios = [
 		{
